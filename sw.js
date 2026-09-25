@@ -3,7 +3,7 @@
 //  - Archivos de la app (html/js/manifest): primero la red, para recibir
 //    actualizaciones; si no hay senal, la copia guardada.
 //  - Modelos, motor wasm y fuentes: primero la copia guardada (no cambian).
-const CACHE = "visor-v3";
+const CACHE = "visor-v4";
 const CORE = [
   "./", "index.html", "detector-worker.js", "manifest.webmanifest", "icon-192.png", "icon-512.png",
   "models/efficientdet_lite0.tflite",
