@@ -209,7 +209,7 @@
 //     pero igual separada del dibujo.
 // ============================================================================
 const VER = "1.0.1";
-const APPV = "9";                                   // sube con cada version: evita workers viejos en cache
+const APPV = "10";                                   // sube con cada version: evita workers viejos en cache
 const CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const MODELS = {
   lite0: ["models/efficientdet_lite0.tflite",
@@ -651,7 +651,8 @@ function computeView() {
     const f0 = fullWin(), cover = Math.max(f0.w / vw, f0.h / vh);
     const mismatch = (vh > vw) !== (canvas.height > canvas.width);
     view.base = mismatch ? Math.min(MAXZ, cover) : 1;
-    view.z = view.base; view.cx = vw / 2; view.cy = vh / 2; view.init = false;
+    view.z = view.base * (view.resumeZoom || 1); view.cx = vw / 2; view.cy = vh / 2; view.init = false;
+    view.resumeZoom = 0;
   }
   const f = fullWin(), w = f.w / view.z, h = f.h / view.z;
   if (!view.cx) { view.cx = vw / 2; view.cy = vh / 2; }
@@ -1261,9 +1262,35 @@ $("setBtn").onclick = () => { syncSettings(); $("diag").textContent = diagText()
 $("closeSet").onclick = async () => { $("settings").hidden = true;
   try { await AI.init(); } catch (e) { status("No se pudo cargar el modelo."); }
   if (S.hands) HANDS.start(); else HANDS.stop(); };
-document.addEventListener("visibilitychange", async () => {
-  if (document.visibilityState === "visible" && running) { try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {} }
+// ---------------------------------------------------------------- primer plano
+// La camara y el microfono solo se usan con la app en primer plano: al salir
+// (otra app, pantalla bloqueada) se apagan; al volver se reabren con el mismo zoom.
+let camPaused = false;
+function releaseCamera() {
+  if (rec) stopRecording();                                  // se guarda lo grabado hasta ese momento
+  if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+  if (source === "camera" && stream) {
+    view.resumeZoom = zoomShown();
+    stream.getTracks().forEach(t => t.stop()); stream = null;
+    video.srcObject = null;
+    camPaused = true;
+  }
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+}
+async function reacquireCamera() {
+  if (!running) return;
+  try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {}
+  if (!camPaused) return;
+  camPaused = false;
+  try { await startCamera(); }
+  catch (e) { status("No se pudo reabrir la cámara. Toca la pantalla para reintentar."); camPaused = true; }
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") releaseCamera(); else reacquireCamera();
 });
+window.addEventListener("pagehide", releaseCamera);
+document.addEventListener("freeze", releaseCamera);
+document.addEventListener("pointerdown", () => { if (camPaused && document.visibilityState === "visible") reacquireCamera(); });
 syncSettings();
 
 $("ver").textContent = "Versión " + APPV;
