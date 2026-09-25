@@ -154,8 +154,10 @@
         <button class="opt" data-k="trails">Rastro</button>
         <button class="opt" data-k="net">Red</button>
         <button class="opt" data-k="counts">Contador</button>
-        <button class="opt" data-k="hands">Manos</button>
+        <button class="opt" data-k="hands">Manos y gestos</button>
       </div></div>
+    <p>Gestos: pellizca con las dos manos y sepáralas para crear un panel · pellizca un panel para moverlo · dos manos sobre un panel lo giran y escalan · mano abierta 1 s sobre un panel cambia el filtro · sácalo de la pantalla para borrarlo.</p>
+    <button class="btn ghost" id="clearPanels">Borrar paneles</button>
     <div class="row"><label for="conf">Confianza mínima <span id="confV"></span></label>
       <input type="range" id="conf" min="20" max="80" step="5"></div>
     <div class="row"><label>Audio al grabar</label>
@@ -192,6 +194,7 @@
 //     pero igual separada del dibujo.
 // ============================================================================
 const VER = "1.0.1";
+const APPV = "5";                                   // sube con cada version: evita workers viejos en cache
 const CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const MODELS = {
   lite0: ["models/efficientdet_lite0.tflite",
@@ -251,8 +254,11 @@ const AI = {
   async init() {
     const want = { model: S.model, hands: S.hands, engine: S.engine };
     if (this.ready && this.model === want.model && this.engine === want.engine && (this.hands || !want.hands)) return;
+    // solo avisar de la descarga si el modelo aun no esta guardado en el telefono
+    let cached = false;
+    try { cached = !!(window.caches && await caches.match(absUrls(MODELS[S.model])[0])); } catch (e) {}
     status("Cargando modelo " + (S.model === "lite2" ? "preciso" : "rápido") +
-           "… la primera vez descarga unos 20 MB y puede tardar con datos móviles.");
+           (cached ? "…" : "… primera vez: descarga unos 20 MB (luego queda guardado en el teléfono)."));
     const saved = S.pref && S.pref[want.model];
     const prefer = want.engine !== "auto" ? want.engine : (saved || "GPU");
     // sin preferencia guardada y en Auto: medir ambos motores con los primeros cuadros
@@ -278,7 +284,7 @@ const AI = {
     if (this.worker) { this.worker.terminate(); this.worker = null; }
     this.busy = false;
     return new Promise((ok, bad) => {
-      const w = new Worker("detector-worker.js", { type: "module" });
+      const w = new Worker(`detector-worker.js?v=${APPV}`, { type: "module" });
       const t = setTimeout(() => bad(new Error("la carga tardó más de 3 minutos")), 180000);
       w.onmessage = e => {
         const m = e.data;
@@ -347,6 +353,8 @@ const AI = {
     // en el hilo principal la IA congela el dibujo mientras trabaja: se espacia
     // para que el video tenga cuadros libres entre deteccion y deteccion
     if (this.mode === "main" && performance.now() - (this.lastMain || 0) < Math.max(120, aiMs * 1.5)) return;
+    if (S.hands && this.mode === "worker" && performance.now() - (this.lastSend || 0) < 250) return;   // prioridad a las manos
+    this.lastSend = performance.now();
     const W = video.videoWidth, H = video.videoHeight, dw = DET_W[S.model] || 384;
     const sw = Math.min(dw, W), sh = Math.round(H * sw / W);
     if (small.width !== sw || small.height !== sh) { small.width = sw; small.height = sh; }
@@ -389,7 +397,279 @@ function handleResult(m) {
              label: ES[d.name] || d.name.toUpperCase(), score: d.score };
   });
   updateTracks(list, now);
-  handRes = m.hands ? m.hands.map(h => h.map(([x, y]) => [mirror ? 1 - x : x, y])) : null;
+  if (m.hands && !HANDS.ready) setHands(m.hands.map((pts, i) => ({ pts, label: "H" + i })), now);
+}
+
+
+// ---------------------------------------------------------------- manos (hilo propio)
+// Las manos van en su propio worker para que el esqueleto y los gestos
+// respondan en ~50 ms aunque la deteccion de objetos sea lenta.
+const HAND_W = 320;
+const hsmall = document.createElement("canvas");
+const hctx = hsmall.getContext("2d");
+const HANDS = {
+  worker: null, ready: false, starting: false, busy: false, delegate: "—", ms: 0, rate: 0, last: 0, frameId: 0, error: "",
+
+  async start() {
+    if (this.ready || this.starting) return;
+    this.starting = true;
+    try {
+      await new Promise((ok, bad) => {
+        const w = new Worker(`detector-worker.js?v=${APPV}`, { type: "module" });
+        const t = setTimeout(() => bad(new Error("la carga de manos tardó demasiado")), 180000);
+        w.onmessage = e => {
+          const m = e.data;
+          if (m.type === "ready") { clearTimeout(t); this.delegate = m.delegate; this.worker = w; ok(); }
+          else if (m.type === "error" && !this.worker) { clearTimeout(t); w.terminate(); bad(new Error(m.message)); }
+          else if (m.type === "result") this.onResult(m);
+          else if (m.type === "error") this.busy = false;
+        };
+        w.onerror = e => { e.preventDefault(); clearTimeout(t); w.terminate(); bad(new Error(e.message || "worker")); };
+        w.postMessage({ type: "init", task: "hands", urls: absUrls(MODELS.hands),
+                        prefer: (S.engine !== "auto" ? S.engine : (S.pref && S.pref.lite0)) || "GPU" });
+      });
+      this.ready = true;
+    } catch (e) {
+      this.error = String(e.message || e); console.warn("manos:", e); status("No se pudieron cargar las manos: " + this.error);
+    } finally { this.starting = false; }
+  },
+
+  stop() {
+    if (this.worker) this.worker.terminate();
+    this.worker = null; this.ready = false; this.busy = false; handRes = null;
+  },
+
+  async pump() {
+    if (!this.ready || this.busy || video.readyState < 2 || !video.videoWidth) return;
+    if (source === "file" && video.paused) return;
+    const W = video.videoWidth, H = video.videoHeight, sw = Math.min(HAND_W, W), sh = Math.round(H * sw / W);
+    if (hsmall.width !== sw || hsmall.height !== sh) { hsmall.width = sw; hsmall.height = sh; }
+    hctx.drawImage(video, 0, 0, sw, sh);
+    this.busy = true;
+    try {
+      const bitmap = await createImageBitmap(hsmall);
+      this.worker.postMessage({ type: "frame", id: ++this.frameId, ts: performance.now(), bitmap }, [bitmap]);
+    } catch (e) { this.busy = false; }
+  },
+
+  onResult(m) {
+    const now = performance.now();
+    this.busy = false;
+    this.ms = this.ms ? this.ms * 0.8 + m.ms * 0.2 : m.ms;
+    if (this.last) this.rate = this.rate * 0.8 + (1000 / Math.max(1, now - this.last)) * 0.2;
+    this.last = now;
+    setHands(m.hands || [], now);
+  },
+};
+
+// convierte al sistema del lienzo (pixeles, con espejo si es camara frontal)
+function setHands(list, now) {
+  const W = canvas.width || video.videoWidth, H = canvas.height || video.videoHeight;
+  const mirror = source === "camera" && facing === "user";
+  handRes = { t: now, hands: list.map(h => ({
+    // con espejo, la mano "Left" del modelo es la derecha del usuario en pantalla
+    label: h.label,
+    pts: h.pts.map(([x, y]) => [(mirror ? 1 - x : x) * W, y * H]) })) };
+}
+
+// ---------------------------------------------------------------- gestos y paneles
+const FILTERS = ["HOLOGRAMA", "TERMICO", "RAYOS X", "PIXEL", "GLITCH"];
+let panels = [];
+const G = {};                        // estado por mano (Left / Right)
+let creating = null, gestureMsg = "", gestureMsgT = 0;
+const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
+
+function handInfo(h) {
+  const P = h.pts, size = dist(P[0], P[9]) || 1;
+  const pinchD = dist(P[4], P[8]) / size;
+  const ext = [[8, 6], [12, 10], [16, 14], [20, 18]].filter(([t, p]) => dist(P[t], P[0]) > dist(P[p], P[0]) * 1.12).length
+            + (dist(P[4], P[17]) > dist(P[3], P[17]) * 1.05 ? 1 : 0);
+  return { size, pinchD, open: ext >= 5, pt: [(P[4][0] + P[8][0]) / 2, (P[4][1] + P[8][1]) / 2], palm: P[9] };
+}
+
+function panelContains(p, x, y) {
+  const dx = x - p.cx, dy = y - p.cy, c = Math.cos(-p.angle), s = Math.sin(-p.angle);
+  const lx = dx * c - dy * s, ly = dx * s + dy * c;
+  return Math.abs(lx) <= p.w / 2 && Math.abs(ly) <= p.h / 2;
+}
+const panelAt = (x, y) => { for (let i = panels.length - 1; i >= 0; i--) if (panelContains(panels[i], x, y)) return panels[i]; return null; };
+const say = t => { gestureMsg = t; gestureMsgT = performance.now(); };
+
+function updateGestures(now) {
+  if (!S.hands || !handRes) return;
+  if (now - handRes.t > 400) { for (const k in G) G[k].pinching = false; creating = null; return; }  // datos viejos: soltar
+  const present = new Set();
+  for (const h of handRes.hands) {
+    const k = h.label; present.add(k);
+    const g = G[k] || (G[k] = { pinching: false, pt: null, openSince: 0, drag: null });
+    const inf = handInfo(h);
+    const was = g.pinching;
+    if (g.pinching && inf.pinchD > 0.55) g.pinching = false;
+    else if (!g.pinching && inf.pinchD < 0.35) g.pinching = true;
+    // al empezar un pellizco (o reaparecer la mano) el punto arranca exacto, sin arrastrar el suavizado
+    const fresh = !g.pt || (g.pinching && !was) || now - (g.seen || 0) > 300;
+    g.pt = fresh ? inf.pt : [g.pt[0] + (inf.pt[0] - g.pt[0]) * 0.7, g.pt[1] + (inf.pt[1] - g.pt[1]) * 0.7];
+    g.seen = now;
+    // mano abierta 1 s sobre un panel -> siguiente filtro
+    if (inf.open && !g.pinching) {
+      if (!g.openSince) g.openSince = now;
+      else if (now - g.openSince > 1000) {
+        const p = panelAt(...inf.palm);
+        if (p) { p.filt = (p.filt + 1) % FILTERS.length; say("Filtro: " + FILTERS[p.filt]); }
+        g.openSince = now + 600;
+      }
+    } else g.openSince = 0;
+  }
+  for (const k in G) if (!present.has(k)) { G[k].pinching = false; G[k].drag = null; }
+
+  const pinching = Object.entries(G).filter(([k, g]) => g.pinching && present.has(k));
+  if (pinching.length >= 2) {
+    const [a, b] = [pinching[0][1], pinching[1][1]];
+    let target = a.drag || b.drag || panelAt(...a.pt) || panelAt(...b.pt);
+    if (target) {
+      // dos manos sobre un panel: mover, girar y escalar
+      const ang = Math.atan2(b.pt[1] - a.pt[1], b.pt[0] - a.pt[0]), d = dist(a.pt, b.pt);
+      const mid = [(a.pt[0] + b.pt[0]) / 2, (a.pt[1] + b.pt[1]) / 2];
+      if (!target.two) target.two = { ang, d, mid, cx: target.cx, cy: target.cy, w: target.w, h: target.h, angle: target.angle };
+      const r = target.two, k = Math.max(0.3, d / Math.max(1, r.d));
+      target.w = Math.max(px(40), r.w * k); target.h = Math.max(px(30), r.h * k);
+      target.angle = r.angle + (ang - r.ang);
+      target.cx = r.cx + mid[0] - r.mid[0]; target.cy = r.cy + mid[1] - r.mid[1];
+      a.drag = b.drag = target; creating = null;
+    } else {
+      creating = [a.pt, b.pt];                                           // enmarcar un panel nuevo
+    }
+  } else {
+    panels.forEach(p => p.two = null);
+    if (creating) {
+      const [p0, p1] = creating;
+      let w = Math.abs(p1[0] - p0[0]), h = Math.abs(p1[1] - p0[1]);
+      if (Math.max(w, h) > px(50)) {
+        // manos casi a la misma altura (o en vertical): dar una proporcion comoda
+        if (h < w * 0.4) h = w * 0.6;
+        if (w < h * 0.4) w = h * 0.75;
+        panels.push({ cx: (p0[0] + p1[0]) / 2, cy: (p0[1] + p1[1]) / 2, w, h, angle: 0,
+                      filt: panels.length % FILTERS.length, born: now });
+        say("Panel creado");
+      }
+      creating = null;
+    }
+    for (const [k, g] of pinching) {
+      if (!g.drag) {
+        const p = panelAt(...g.pt);
+        if (p) { g.drag = p; g.off = [p.cx - g.pt[0], p.cy - g.pt[1]]; panels = panels.filter(q => q !== p).concat(p); }
+      }
+      if (g.drag) {
+        g.drag.cx = g.pt[0] + g.off[0]; g.drag.cy = g.pt[1] + g.off[1];
+        // arrastrarlo fuera de la pantalla lo borra
+        const W = canvas.width, H = canvas.height;
+        if (g.drag.cx < -g.drag.w * 0.1 || g.drag.cx > W * 1.0 + g.drag.w * 0.1 || g.drag.cy > H + g.drag.h * 0.1 || g.drag.cy < -g.drag.h * 0.1) {
+          panels = panels.filter(q => q !== g.drag); g.drag = null; say("Panel borrado");
+        }
+      }
+    }
+    for (const [k, g] of Object.entries(G)) if (!g.pinching) g.drag = null;
+  }
+}
+
+// dibuja el video tal como se ve en pantalla (con espejo si aplica)
+function drawBase(c, W, H) {
+  if (source === "camera" && facing === "user") { c.save(); c.translate(W, 0); c.scale(-1, 1); c.drawImage(video, 0, 0, W, H); c.restore(); }
+  else c.drawImage(video, 0, 0, W, H);
+}
+const pix = document.createElement("canvas"), pctx = pix.getContext("2d");
+
+function drawPanels(now) {
+  if (!panels.length) return;
+  const W = canvas.width, H = canvas.height, lw = Math.max(1, px(0.6));
+  const active = new Set(Object.values(G).map(g => g.drag).filter(Boolean));
+  if (panels.some(p => FILTERS[p.filt] === "PIXEL")) {
+    pix.width = Math.max(8, Math.round(W / 16)); pix.height = Math.max(8, Math.round(H / 16));
+    pctx.imageSmoothingEnabled = true; drawBase(pctx, pix.width, pix.height);
+  }
+  for (const p of panels) {
+    const f = FILTERS[p.filt];
+    ctx.save();
+    ctx.translate(p.cx, p.cy); ctx.rotate(p.angle);
+    ctx.beginPath(); ctx.rect(-p.w / 2, -p.h / 2, p.w, p.h); ctx.clip();
+    ctx.rotate(-p.angle); ctx.translate(-p.cx, -p.cy);
+    // interior con filtro
+    if (f === "PIXEL") { ctx.imageSmoothingEnabled = false; ctx.drawImage(pix, 0, 0, W, H); ctx.imageSmoothingEnabled = true; }
+    else if (f === "GLITCH") {
+      const n = 10, sh = H / n, seed = Math.floor(now / 90);
+      for (let i = 0; i < n; i++) {
+        const off = ((Math.sin(seed * 12.9898 + i * 78.233) * 43758.5453) % 1) * px(14);
+        ctx.drawImage(canvas, 0, i * sh, W, sh, off, i * sh, W, sh);
+      }
+      ctx.globalCompositeOperation = "screen"; ctx.fillStyle = "rgba(255,0,80,0.18)"; ctx.fillRect(0, 0, W, H);
+      ctx.globalCompositeOperation = "source-over";
+    } else {
+      ctx.filter = f === "HOLOGRAMA" ? "grayscale(1) contrast(1.7) brightness(0.8)"
+                 : f === "TERMICO" ? "grayscale(1) contrast(2.2) brightness(1.05) sepia(1) saturate(9) hue-rotate(-40deg)"
+                 : "grayscale(1) invert(1) contrast(1.6)";
+      drawBase(ctx, W, H);
+      ctx.filter = "none";
+      if (f !== "TERMICO") {
+        ctx.globalCompositeOperation = "multiply";
+        ctx.fillStyle = f === "HOLOGRAMA" ? "#37e6ff" : "#8fc7ff"; ctx.fillRect(0, 0, W, H);
+        ctx.globalCompositeOperation = "source-over";
+      }
+    }
+    // reticula y lineas de escaneo dentro del panel
+    ctx.translate(p.cx, p.cy); ctx.rotate(p.angle);
+    ctx.fillStyle = "rgba(0,0,0,0.22)";
+    for (let y = -p.h / 2; y < p.h / 2; y += px(3)) ctx.fillRect(-p.w / 2, y, p.w, Math.max(1, px(1)));
+    ctx.strokeStyle = "rgba(55,230,255,0.25)"; ctx.lineWidth = lw; ctx.beginPath();
+    for (let i = 1; i < 4; i++) { const x = -p.w / 2 + p.w * i / 4, y = -p.h / 2 + p.h * i / 4;
+      ctx.moveTo(x, -p.h / 2); ctx.lineTo(x, p.h / 2); ctx.moveTo(-p.w / 2, y); ctx.lineTo(p.w / 2, y); }
+    ctx.stroke();
+    const sy = -p.h / 2 + ((now / 1600 + p.born / 997) % 1) * p.h;
+    ctx.fillStyle = "rgba(230,246,255,0.8)"; ctx.fillRect(-p.w / 2, sy, p.w, Math.max(1, px(0.8)));
+    ctx.restore();
+
+    // borde fino + esquinas + etiqueta
+    ctx.save(); ctx.translate(p.cx, p.cy); ctx.rotate(p.angle);
+    const on = active.has(p);
+    ctx.strokeStyle = on ? "#ff4fd8" : "#37e6ff"; ctx.lineWidth = lw * (on ? 1.6 : 1);
+    ctx.strokeRect(-p.w / 2, -p.h / 2, p.w, p.h);
+    const L = Math.min(p.w, p.h) * 0.14;
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = Math.max(1.5, px(1.1)); ctx.beginPath();
+    [[-1, -1], [1, -1], [-1, 1], [1, 1]].forEach(([sx, sy2]) => {
+      const x = sx * p.w / 2, y = sy2 * p.h / 2;
+      ctx.moveTo(x - sx * L, y); ctx.lineTo(x, y); ctx.lineTo(x, y - sy2 * L); });
+    ctx.stroke();
+    ctx.font = font(8, 500); ctx.fillStyle = "#37e6ff"; ctx.textBaseline = "bottom";
+    const deg = ((Math.round(p.angle * 180 / Math.PI) % 360) + 360) % 360;
+    ctx.fillText(`${f}  ${Math.round(p.w)}x${Math.round(p.h)}  ${deg}°`, -p.w / 2, -p.h / 2 - px(3));
+    ctx.restore();
+  }
+}
+
+function drawGestureHUD(now) {
+  if (!S.hands) return;
+  const lw = Math.max(1, px(0.7));
+  if (creating) {
+    const [a, b] = creating;
+    ctx.setLineDash([px(4), px(3)]); ctx.strokeStyle = "#37e6ff"; ctx.lineWidth = lw;
+    ctx.strokeRect(Math.min(a[0], b[0]), Math.min(a[1], b[1]), Math.abs(b[0] - a[0]), Math.abs(b[1] - a[1]));
+    ctx.setLineDash([]);
+    ctx.font = font(8, 500); ctx.fillStyle = "#37e6ff"; ctx.textBaseline = "bottom";
+    ctx.fillText("NUEVO PANEL · suelta una mano", Math.min(a[0], b[0]), Math.min(a[1], b[1]) - px(3));
+  }
+  for (const g of Object.values(G)) {
+    if (!g.pinching || !g.pt) continue;
+    ctx.strokeStyle = "#ff4fd8"; ctx.lineWidth = lw * 1.4;
+    ctx.beginPath(); ctx.arc(g.pt[0], g.pt[1], px(7), 0, 6.3); ctx.stroke();
+    ctx.fillStyle = "#ff4fd8"; ctx.beginPath(); ctx.arc(g.pt[0], g.pt[1], px(1.5), 0, 6.3); ctx.fill();
+  }
+  const msg = now - gestureMsgT < 1600 ? gestureMsg
+            : (!panels.length && handRes && handRes.hands.length ? "Pellizca con las dos manos y sepáralas para crear un panel" : "");
+  if (msg) {
+    ctx.font = font(9, 500); const w = ctx.measureText(msg).width + px(12);
+    const x = (canvas.width - w) / 2, y = canvas.height - px(58);
+    ctx.fillStyle = "rgba(4,10,14,0.7)"; ctx.fillRect(x, y, w, px(16));
+    ctx.fillStyle = "#e6f6ff"; ctx.textBaseline = "middle"; ctx.fillText(msg, x + px(6), y + px(8));
+  }
 }
 
 // ---------------------------------------------------------------- fuentes
@@ -432,6 +712,7 @@ async function launch(kind, file) {
   try {
     $("camBtn").disabled = $("galBtn").disabled = true;
     await AI.init();
+    if (S.hands) await HANDS.start();
     if (kind === "camera") await startCamera(); else await startFile(file);
     $("start").hidden = true; $("top").hidden = false; $("bottom").hidden = false;
     $("flipBtn").hidden = kind !== "camera";
@@ -571,19 +852,18 @@ const HAND_EDGES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10]
   [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
 const FINGERS = [["THUMB",4],["INDEX",8],["MIDDLE",12],["RING",16],["PINKY",20]];
 function drawHands() {
-  if (!handRes) return;
-  const W = canvas.width, H = canvas.height;
-  ctx.lineWidth = Math.max(1, px(0.6));
-  handRes.forEach(lm => {
-    const P = lm.map(([x, y]) => [x * W, y * H]);
-    ctx.strokeStyle = "#37e6ff"; ctx.beginPath();
+  if (!handRes || performance.now() - handRes.t > 500) return;          // no dibujar manos viejas
+  const lw = Math.max(1, px(0.6));
+  handRes.hands.forEach(h => {
+    const P = h.pts, g = G[h.label], col = g && g.pinching ? "#ff4fd8" : "#37e6ff";
+    ctx.lineWidth = lw; ctx.strokeStyle = col; ctx.beginPath();
     HAND_EDGES.forEach(([a, b]) => { ctx.moveTo(...P[a]); ctx.lineTo(...P[b]); }); ctx.stroke();
-    P.forEach(p => { ctx.beginPath(); ctx.arc(p[0], p[1], px(1.6), 0, 6.3); ctx.stroke(); });
+    P.forEach(p => { ctx.beginPath(); ctx.arc(p[0], p[1], px(1.5), 0, 6.3); ctx.stroke(); });
     FINGERS.forEach(([name, i]) => {
       const [x, y] = P[i];
-      ctx.strokeStyle = "#ffffff"; ctx.strokeRect(x - px(4), y - px(4), px(8), px(8));
-      ctx.font = font(7, 500); ctx.fillStyle = "#ffb347"; ctx.textBaseline = "bottom";
-      ctx.fillText(`${name} ${Math.round(x)},${Math.round(y)}`, x + px(6), y - px(3));
+      ctx.strokeStyle = "#ffffff"; ctx.strokeRect(x - px(3.5), y - px(3.5), px(7), px(7));
+      ctx.font = font(6.5, 500); ctx.fillStyle = "#ffb347"; ctx.textBaseline = "bottom";
+      ctx.fillText(`${name} ${Math.round(x)},${Math.round(y)}`, x + px(5), y - px(3));
     });
   });
 }
@@ -650,14 +930,16 @@ function loop(now) {
   } else ctx.drawImage(video, 0, 0, W, H);
 
   AI.pump();                              // no espera: la IA responde cuando puede
+  if (S.hands) { HANDS.pump(); updateGestures(now); }
+  drawPanels(now);
   drawTracks(now, dtFrame);
-  if (S.hands) drawHands();
+  if (S.hands) { drawHands(); drawGestureHUD(now); }
   drawFrameHUD(now);
 
   if (now - chipT > 400) {
     chipT = now;
     $("hudChip").textContent =
-      `VIDEO ${fps.toFixed(0)} · IA ${aiRate.toFixed(0)}/s · ${aiMs.toFixed(0)} ms · ${AI.benchmarking ? "MIDIENDO " : ""}${delegate}${AI.mode === "main" ? " · COMPAT" : ""}`;
+      `VIDEO ${fps.toFixed(0)} · IA ${aiRate.toFixed(0)}/s · ${aiMs.toFixed(0)} ms · ${AI.benchmarking ? "MIDIENDO " : ""}${delegate}${AI.mode === "main" ? " · COMPAT" : ""}${S.hands ? ` · MANOS ${HANDS.rate.toFixed(0)}/s` : ""}`;
   }
 }
 
@@ -760,15 +1042,18 @@ function diagText() {
     AI.fallbackReason ? `Motivo del respaldo: ${AI.fallbackReason}` : "",
     prev ? `Último respaldo: ${prev}` : "",
     `Video ${fps.toFixed(0)} FPS · IA ${aiRate.toFixed(1)}/s · ${aiMs.toFixed(0)} ms`,
+    `Manos: ${S.hands ? (HANDS.ready ? `hilo propio · ${HANDS.delegate} · ${HANDS.rate.toFixed(0)}/s · ${HANDS.ms.toFixed(0)} ms` : (HANDS.error || "cargando")) : "apagadas"}`,
     `Cámara: ${video.videoWidth}x${video.videoHeight}`,
     `GPU: ${gl}`,
     `Workers de módulo: ${typeof OffscreenCanvas !== "undefined" ? "OffscreenCanvas sí" : "sin OffscreenCanvas"}`,
     `Navegador: ${navigator.userAgent}`,
   ].filter(Boolean).join(String.fromCharCode(10));
 }
+$("clearPanels").onclick = () => { panels = []; say("Paneles borrados"); };
 $("setBtn").onclick = () => { syncSettings(); $("diag").textContent = diagText(); $("settings").hidden = false; };
 $("closeSet").onclick = async () => { $("settings").hidden = true;
-  try { await AI.init(); } catch (e) { status("No se pudo cargar el modelo."); } };
+  try { await AI.init(); } catch (e) { status("No se pudo cargar el modelo."); }
+  if (S.hands) HANDS.start(); else HANDS.stop(); };
 document.addEventListener("visibilitychange", async () => {
   if (document.visibilityState === "visible" && running) { try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {} }
 });
@@ -783,7 +1068,9 @@ if ("serviceWorker" in navigator && location.protocol === "https:") {
 }
 window.__visor = { get tracks() { return tracks; }, get fps() { return fps; }, get aiMs() { return aiMs; },
                    get aiRate() { return aiRate; }, get delegate() { return delegate; }, get mode() { return AI.mode; },
-                   get bench() { return AI.benchResults; }, get ai() { return AI; }, S };
+                   get bench() { return AI.benchResults; }, get ai() { return AI; }, get handsCtl() { return HANDS; },
+                   get panels() { return panels; }, set panels(v) { panels = v; }, get handRes() { return handRes; },
+                   get creating() { return creating; }, setHands, updateGestures, G, S };
 </script>
 </body>
 </html>

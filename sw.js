@@ -3,9 +3,9 @@
 //  - Archivos de la app (html/js/manifest): primero la red, para recibir
 //    actualizaciones; si no hay senal, la copia guardada.
 //  - Modelos, motor wasm y fuentes: primero la copia guardada (no cambian).
-const CACHE = "visor-v4";
+const CACHE = "visor-v5";
 const CORE = [
-  "./", "index.html", "detector-worker.js", "manifest.webmanifest", "icon-192.png", "icon-512.png",
+  "./", "index.html", "detector-worker.js?v=5", "manifest.webmanifest", "icon-192.png", "icon-512.png",
   "models/efficientdet_lite0.tflite",
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs",
 ];
@@ -34,7 +34,7 @@ self.addEventListener("fetch", e => {
   const url = new URL(req.url);
   const appFile = url.origin === location.origin && !url.pathname.includes("/models/");
   if (appFile) {
-    e.respondWith(fetch(req).then(res => put(req, res)).catch(() => caches.match(req, { ignoreSearch: true })));
+    e.respondWith(fetch(req, { cache: "no-cache" }).then(res => put(req, res)).catch(() => caches.match(req, { ignoreSearch: true })));
   } else {
     e.respondWith(caches.match(req).then(hit => hit || fetch(req).then(res => put(req, res))));
   }
