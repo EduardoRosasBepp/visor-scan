@@ -35,6 +35,7 @@
      el navegador lo pausaria para ahorrar energia */
   #view { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; object-fit: cover; display: block; background: var(--ground); }
   #view.contain { object-fit: contain; }
+  #view { touch-action: none; }
   video#src { position: absolute; inset: 0; z-index: 0; width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
 
   /* ---- controles ---- */
@@ -159,6 +160,12 @@
         <button class="opt" data-k="counts">Contador</button>
         <button class="opt" data-k="hands">Manos y gestos</button>
       </div></div>
+    <div class="row"><label>Gestos con dos manos</label>
+      <div class="seg" data-key="gmode">
+        <button class="opt" data-v="panels">Crear paneles</button>
+        <button class="opt" data-v="zoom">Zoom</button>
+      </div></div>
+    <p>Zoom en pantalla: pellizca con dos dedos · doble toque = encuadre completo.</p>
     <p>Gestos: pellizca con las dos manos y sepáralas para crear un panel · pellizca un panel para moverlo · dos manos sobre un panel lo giran y escalan · mano abierta 1 s sobre un panel cambia el filtro · sácalo de la pantalla para borrarlo.</p>
     <div class="btns">
       <button class="btn ghost" id="clearPanels">Borrar paneles</button>
@@ -200,7 +207,7 @@
 //     pero igual separada del dibujo.
 // ============================================================================
 const VER = "1.0.1";
-const APPV = "6";                                   // sube con cada version: evita workers viejos en cache
+const APPV = "7";                                   // sube con cada version: evita workers viejos en cache
 const CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const MODELS = {
   lite0: ["models/efficientdet_lite0.tflite",
@@ -239,7 +246,7 @@ const canvas = $("view"), ctx = canvas.getContext("2d");
 const video = $("src");
 const small = document.createElement("canvas");            // copia reducida para la IA
 const sctx = small.getContext("2d", { willReadFrequently: false });
-const S = { model: "lite0", engine: "auto", trails: true, net: true, counts: true, hands: false, conf: 0.4, audio: "on", pref: {} };
+const S = { model: "lite0", engine: "auto", trails: true, net: true, counts: true, hands: false, conf: 0.4, audio: "on", pref: {}, gmode: "panels" };
 try { Object.assign(S, JSON.parse(localStorage.getItem("visor") || "{}")); } catch (e) {}
 const save = () => { try { localStorage.setItem("visor", JSON.stringify(S)); } catch (e) {} };
 
@@ -307,7 +314,7 @@ const AI = {
   onWorker(m) {
     if (m.type === "error") { this.busy = false; console.warn("IA:", m.message); return; }
     if (m.type !== "result") return;
-    delegate = m.delegate; this.busy = false; handleResult(m);
+    delegate = m.delegate; this.busy = false; m.crop = this.sentCrop; handleResult(m);
     if (this.bench) this.benchStep(m.detMs, m.delegate);
   },
 
@@ -362,18 +369,19 @@ const AI = {
     if (S.hands && this.mode === "worker" && performance.now() - (this.lastSend || 0) < 250) return;   // prioridad a las manos
     this.lastSend = performance.now();
     if (!crop.w) return;
-    grab(small, sctx, DET_W[S.model] || 384);
+    const sent = grab(small, sctx, DET_W[S.model] || 384);
     const sw = small.width, sh = small.height;
     this.busy = true;
     const id = ++this.frameId, ts = performance.now();
     if (this.mode === "worker") {
       try {
         const bitmap = await createImageBitmap(small);
+        this.sentCrop = sent;
         this.worker.postMessage({ type: "frame", id, ts, bitmap, hands: S.hands }, [bitmap]);
       } catch (e) { this.busy = false; }
     } else {
       setTimeout(() => {
-        const t0 = performance.now(), out = { w: sw, h: sh, dets: [], hands: null };
+        const t0 = performance.now(), out = { w: sw, h: sh, dets: [], hands: null, crop: sent };
         try {
           out.dets = this.main.det.detectForVideo(small, ts).detections.map(d => ({
             x: d.boundingBox.originX, y: d.boundingBox.originY, w: d.boundingBox.width, h: d.boundingBox.height,
@@ -394,15 +402,12 @@ function handleResult(m) {
   aiMs = aiMs ? aiMs * 0.8 + m.ms * 0.2 : m.ms;
   if (aiLast) aiRate = aiRate * 0.8 + (1000 / Math.max(1, now - aiLast)) * 0.2;
   aiLast = now;
-  const W = canvas.width, k = W / m.w;
-  const mirror = source === "camera" && facing === "user";
-  const list = m.dets.filter(d => d.score >= S.conf).map(d => {
-    const x = d.x * k, w = d.w * k;
-    return { box: [mirror ? W - x - w : x, d.y * k, w, d.h * k],
-             label: ES[d.name] || d.name.toUpperCase(), score: d.score };
-  });
+  const c = m.crop || crop, kx = c.w / m.w, ky = c.h / m.h;
+  const list = m.dets.filter(d => d.score >= S.conf).map(d => ({
+    box: [c.x + d.x * kx, c.y + d.y * ky, d.w * kx, d.h * ky],        // coordenadas del video
+    label: ES[d.name] || d.name.toUpperCase(), score: d.score }));
   updateTracks(list, now);
-  if (m.hands && !HANDS.ready) setHands(m.hands.map((pts, i) => ({ pts, label: "H" + i })), now);
+  if (m.hands && !HANDS.ready) setHands(m.hands.map((pts, i) => ({ pts, label: "H" + i })), now, c);
 }
 
 
@@ -448,7 +453,7 @@ const HANDS = {
     if (!this.ready || this.busy || video.readyState < 2 || !video.videoWidth) return;
     if (source === "file" && video.paused) return;
     if (!crop.w) return;
-    grab(hsmall, hctx, HAND_W);
+    this.sentCrop = grab(hsmall, hctx, HAND_W);
     this.busy = true;
     try {
       const bitmap = await createImageBitmap(hsmall);
@@ -462,19 +467,16 @@ const HANDS = {
     this.ms = this.ms ? this.ms * 0.8 + m.ms * 0.2 : m.ms;
     if (this.last) this.rate = this.rate * 0.8 + (1000 / Math.max(1, now - this.last)) * 0.2;
     this.last = now;
-    setHands(m.hands || [], now);
+    setHands(m.hands || [], now, this.sentCrop);
   },
 };
 
 // convierte al sistema del lienzo (pixeles, con espejo si es camara frontal)
-function setHands(list, now) {
-  const W = canvas.width || video.videoWidth, H = canvas.height || video.videoHeight;
-  const mirror = source === "camera" && facing === "user";
-  handRes = { t: now, hands: list.map(h => ({
-    // con espejo, la mano "Left" del modelo es la derecha del usuario en pantalla
-    label: h.label,
-    pts: h.pts.map(([x, y]) => [(mirror ? 1 - x : x) * W, y * H]) })) };
+function setHands(list, now, c = crop) {
+  handRes = { t: now, hands: list.map(h => ({ label: h.label,
+    vpts: h.pts.map(([x, y]) => [c.x + x * c.w, c.y + y * c.h]) })) };       // coordenadas del video
 }
+const cpts = h => h.vpts.map(([x, y]) => v2c(x, y));                        // a la pantalla
 
 // ---------------------------------------------------------------- gestos y paneles
 const FILTERS = ["HOLOGRAMA", "TERMICO", "RAYOS X", "PIXEL", "GLITCH"];
@@ -483,8 +485,8 @@ const G = {};                        // estado por mano (Left / Right)
 let creating = null, gestureMsg = "", gestureMsgT = 0;
 const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]);
 
-function handInfo(h) {
-  const P = h.pts, size = dist(P[0], P[9]) || 1;
+function handInfo(P) {
+  const size = dist(P[0], P[9]) || 1;
   const pinchD = dist(P[4], P[8]) / size;
   const ext = [[8, 6], [12, 10], [16, 14], [20, 18]].filter(([t, p]) => dist(P[t], P[0]) > dist(P[p], P[0]) * 1.12).length
             + (dist(P[4], P[17]) > dist(P[3], P[17]) * 1.05 ? 1 : 0);
@@ -499,32 +501,56 @@ function panelContains(p, x, y) {
 const panelAt = (x, y) => { for (let i = panels.length - 1; i >= 0; i--) if (panelContains(panels[i], x, y)) return panels[i]; return null; };
 const say = t => { gestureMsg = t; gestureMsgT = performance.now(); };
 
+// Modo zoom con las manos (camara trasera: alguien frente a la camara):
+// dos manos pellizcando y separandose = acercar; juntandose = alejar;
+// una mano pellizcando = mover la imagen cuando hay zoom.
+let ZG = null, PG = null;
+function zoomGestures(present) {
+  creating = null;
+  if (source !== "camera") return;
+  const pin = Object.entries(G).filter(([k, g]) => g.pinching && present.has(k)).map(([, g]) => g);
+  if (pin.length >= 2) {
+    PG = null;
+    const [a, b] = pin, d = dist(a.ptV, b.ptV), mid = [(a.ptV[0] + b.ptV[0]) / 2, (a.ptV[1] + b.ptV[1]) / 2];
+    if (!ZG) ZG = { d0: Math.max(1, d), z0: view.z, cx0: view.cx, cy0: view.cy, m0: mid };
+    const z = Math.min(MAXZ, Math.max(1, ZG.z0 * d / ZG.d0)), k = ZG.z0 / z;
+    setZoom(z, ZG.m0[0] + (ZG.cx0 - ZG.m0[0]) * k, ZG.m0[1] + (ZG.cy0 - ZG.m0[1]) * k);
+  } else if (pin.length === 1 && view.z > 1.01) {
+    ZG = null;
+    const g = pin[0];
+    if (!PG) PG = { p0: g.ptV.slice(), cx0: view.cx, cy0: view.cy };
+    view.cx = PG.cx0 - (g.ptV[0] - PG.p0[0]); view.cy = PG.cy0 - (g.ptV[1] - PG.p0[1]);
+  } else { ZG = null; PG = null; }
+}
+
 function updateGestures(now) {
   if (!S.hands || !handRes) return;
   if (now - handRes.t > 400) { for (const k in G) G[k].pinching = false; creating = null; return; }  // datos viejos: soltar
   const present = new Set();
   for (const h of handRes.hands) {
     const k = h.label; present.add(k);
-    const g = G[k] || (G[k] = { pinching: false, pt: null, openSince: 0, drag: null });
-    const inf = handInfo(h);
+    const g = G[k] || (G[k] = { pinching: false, pt: null, ptV: null, openSince: 0, drag: null });
+    const inf = handInfo(h.vpts);
     const was = g.pinching;
     if (g.pinching && inf.pinchD > 0.55) g.pinching = false;
     else if (!g.pinching && inf.pinchD < 0.35) g.pinching = true;
     // al empezar un pellizco (o reaparecer la mano) el punto arranca exacto, sin arrastrar el suavizado
-    const fresh = !g.pt || (g.pinching && !was) || now - (g.seen || 0) > 300;
-    g.pt = fresh ? inf.pt : [g.pt[0] + (inf.pt[0] - g.pt[0]) * 0.7, g.pt[1] + (inf.pt[1] - g.pt[1]) * 0.7];
+    const fresh = !g.ptV || (g.pinching && !was) || now - (g.seen || 0) > 300;
+    g.ptV = fresh ? inf.pt : [g.ptV[0] + (inf.pt[0] - g.ptV[0]) * 0.7, g.ptV[1] + (inf.pt[1] - g.ptV[1]) * 0.7];
+    g.pt = v2c(...g.ptV);                                                      // en pantalla (paneles)
     g.seen = now;
     // mano abierta 1 s sobre un panel -> siguiente filtro
     if (inf.open && !g.pinching) {
       if (!g.openSince) g.openSince = now;
       else if (now - g.openSince > 1000) {
-        const p = panelAt(...inf.palm);
+        const p = S.gmode === "zoom" ? null : panelAt(...v2c(...inf.palm));
         if (p) { p.filt = (p.filt + 1) % FILTERS.length; say("Filtro: " + FILTERS[p.filt]); }
         g.openSince = now + 600;
       }
     } else g.openSince = 0;
   }
   for (const k in G) if (!present.has(k)) { G[k].pinching = false; G[k].drag = null; }
+  if (S.gmode === "zoom") { zoomGestures(present); return; }
 
   const pinching = Object.entries(G).filter(([k, g]) => g.pinching && present.has(k));
   if (pinching.length >= 2) {
@@ -576,29 +602,100 @@ function updateGestures(now) {
   }
 }
 
-// dibuja el video tal como se ve en pantalla (con espejo si aplica)
-// Solo se trabaja con la parte del video que se ve en pantalla (recorte "cover").
-// Asi nada se dibuja fuera de la vista y la IA no analiza zonas invisibles.
-let crop = { x: 0, y: 0, w: 0, h: 0 };
-function computeCrop() {
+// ---------------------------------------------------------------- vista y zoom
+// La "ventana" es la parte del video que se ve, con la forma exacta de la pantalla.
+// Zoom 1 = encuadre completo de la camara (sin recorte). Todo (objetos, manos)
+// se guarda en coordenadas del VIDEO y se convierte a la pantalla al dibujar,
+// asi el zoom no descuadra nada.
+const view = { z: 1, cx: 0, cy: 0, toastT: 0 };
+const MAXZ = 8;
+let win = { x: 0, y: 0, w: 1, h: 1 };          // ventana visible (coords de video; puede salirse: franjas)
+let crop = { x: 0, y: 0, w: 0, h: 0 };         // parte real del video dentro de la ventana
+const isMirror = () => source === "camera" && facing === "user";
+function fullWin() {
+  const vw = video.videoWidth, vh = video.videoHeight, a = canvas.width / canvas.height;
+  return vw / vh > a ? { w: vw, h: vw / a } : { w: vh * a, h: vh };
+}
+function computeView() {
   const vw = video.videoWidth, vh = video.videoHeight;
-  if (source === "file" || !innerWidth || !innerHeight) { crop = { x: 0, y: 0, w: vw, h: vh }; return; }
-  const a = innerWidth / innerHeight, va = vw / vh;
-  if (va > a) { const w = Math.round(vh * a); crop = { x: Math.round((vw - w) / 2), y: 0, w, h: vh }; }
-  else { const h = Math.round(vw / a); crop = { x: 0, y: Math.round((vh - h) / 2), w: vw, h }; }
+  if (source === "file") { win = { x: 0, y: 0, w: vw, h: vh }; crop = { ...win }; return; }
+  const f = fullWin(), w = f.w / view.z, h = f.h / view.z;
+  if (!view.cx) { view.cx = vw / 2; view.cy = vh / 2; }
+  const cl = (c, size, full) => size >= full ? full / 2 : Math.min(full - size / 2, Math.max(size / 2, c));
+  view.cx = cl(view.cx, w, vw); view.cy = cl(view.cy, h, vh);
+  win = { x: view.cx - w / 2, y: view.cy - h / 2, w, h };
+  const x0 = Math.max(0, win.x), y0 = Math.max(0, win.y);
+  const x1 = Math.min(vw, win.x + w), y1 = Math.min(vh, win.y + h);
+  crop = { x: x0, y: y0, w: Math.max(1, x1 - x0), h: Math.max(1, y1 - y0) };
+}
+function v2c(x, y) {
+  const W = canvas.width, H = canvas.height;
+  let X = (x - win.x) * W / win.w; if (isMirror()) X = W - X;
+  return [X, (y - win.y) * H / win.h];
+}
+function c2v(X, Y) {
+  const W = canvas.width, H = canvas.height;
+  if (isMirror()) X = W - X;
+  return [win.x + X * win.w / W, win.y + Y * win.h / H];
+}
+function v2cBox(b) {
+  const sx = canvas.width / win.w, sy = canvas.height / win.h, w = b[2] * sx;
+  let X = (b[0] - win.x) * sx; if (isMirror()) X = canvas.width - X - w;
+  return [X, (b[1] - win.y) * sy, w, b[3] * sy];
+}
+function setZoom(z, cx, cy) {
+  view.z = Math.min(MAXZ, Math.max(1, z));
+  if (cx !== undefined) { view.cx = cx; view.cy = cy; }
+  view.toastT = performance.now();
 }
 function drawBase(c, W, H) {
-  const { x, y, w, h } = crop;
-  if (source === "camera" && facing === "user") { c.save(); c.translate(W, 0); c.scale(-1, 1); c.drawImage(video, x, y, w, h, 0, 0, W, H); c.restore(); }
-  else c.drawImage(video, x, y, w, h, 0, 0, W, H);
+  const sx = W / win.w, sy = H / win.h;
+  if (crop.w < win.w - 1 || crop.h < win.h - 1) { c.fillStyle = "#05090d"; c.fillRect(0, 0, W, H); }
+  const dx = (crop.x - win.x) * sx, dy = (crop.y - win.y) * sy, dw = crop.w * sx, dh = crop.h * sy;
+  if (isMirror()) { c.save(); c.translate(W, 0); c.scale(-1, 1); c.drawImage(video, crop.x, crop.y, crop.w, crop.h, dx, dy, dw, dh); c.restore(); }
+  else c.drawImage(video, crop.x, crop.y, crop.w, crop.h, dx, dy, dw, dh);
 }
-// copia reducida del recorte, con el lado largo = maxSide
+// copia reducida de la parte visible (lado largo = maxSide); devuelve que region se copio
 function grab(cv, cx2, maxSide) {
   const k = Math.min(1, maxSide / Math.max(crop.w, crop.h));
   const sw = Math.max(1, Math.round(crop.w * k)), sh = Math.max(1, Math.round(crop.h * k));
   if (cv.width !== sw || cv.height !== sh) { cv.width = sw; cv.height = sh; }
   cx2.drawImage(video, crop.x, crop.y, crop.w, crop.h, 0, 0, sw, sh);
+  return { ...crop };
 }
+
+// ---------------------------------------------------------------- zoom con dos dedos
+const touchPts = new Map(); let TP = null, lastTap = 0;
+const toCanvas = e => { const r = canvas.getBoundingClientRect();
+  return [(e.clientX - r.left) * canvas.width / r.width, (e.clientY - r.top) * canvas.height / r.height]; };
+canvas.addEventListener("pointerdown", e => {
+  if (source !== "camera") return;
+  touchPts.set(e.pointerId, toCanvas(e));
+  if (touchPts.size === 1) {                                    // doble toque: encuadre completo
+    const now = performance.now();
+    if (now - lastTap < 320) { setZoom(1, video.videoWidth / 2, video.videoHeight / 2); lastTap = 0; } else lastTap = now;
+  }
+  if (touchPts.size === 2) {
+    const [a, b] = [...touchPts.values()], mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+    TP = { d0: Math.max(1, dist(a, b)), z0: view.z, v0: c2v(...mid) };
+  }
+});
+canvas.addEventListener("pointermove", e => {
+  if (!touchPts.has(e.pointerId)) return;
+  touchPts.set(e.pointerId, toCanvas(e));
+  if (touchPts.size !== 2 || !TP) return;
+  const [a, b] = [...touchPts.values()], mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+  const z = Math.min(MAXZ, Math.max(1, TP.z0 * dist(a, b) / TP.d0));
+  const f = fullWin(), w = f.w / z, h = f.h / z;
+  let fx = mid[0] / canvas.width; if (isMirror()) fx = 1 - fx;
+  const fy = mid[1] / canvas.height;
+  // el punto que estaba bajo los dedos se queda bajo los dedos
+  setZoom(z, TP.v0[0] - fx * w + w / 2, TP.v0[1] - fy * h + h / 2);
+});
+const endTouch = e => { touchPts.delete(e.pointerId); if (touchPts.size < 2) TP = null; };
+canvas.addEventListener("pointerup", endTouch);
+canvas.addEventListener("pointercancel", endTouch);
+
 const pix = document.createElement("canvas"), pctx = pix.getContext("2d");
 
 function drawPanels(now) {
@@ -668,7 +765,7 @@ function drawPanels(now) {
 }
 
 function drawGestureHUD(now) {
-  if (!S.hands) return;
+  if (!S.hands && now - view.toastT > 1200) return;
   const lw = Math.max(1, px(0.7));
   if (creating) {
     const [a, b] = creating;
@@ -684,8 +781,11 @@ function drawGestureHUD(now) {
     ctx.beginPath(); ctx.arc(g.pt[0], g.pt[1], px(7), 0, 6.3); ctx.stroke();
     ctx.fillStyle = "#ff4fd8"; ctx.beginPath(); ctx.arc(g.pt[0], g.pt[1], px(1.5), 0, 6.3); ctx.fill();
   }
-  const msg = now - gestureMsgT < 1600 ? gestureMsg
-            : (!panels.length && handRes && handRes.hands.length ? "Pellizca con las dos manos y sepáralas para crear un panel" : "");
+  const msg = now - view.toastT < 1200 ? `ZOOM ${view.z.toFixed(1)}x`
+            : now - gestureMsgT < 1600 ? gestureMsg
+            : (handRes && handRes.hands.length && now - handRes.t < 500
+               ? (S.gmode === "zoom" ? "Modo zoom: pellizca con dos manos y sepáralas"
+                  : (!panels.length ? "Pellizca con las dos manos y sepáralas para crear un panel" : "")) : "");
   if (msg) {
     ctx.font = font(9, 500); const w = ctx.measureText(msg).width + px(12);
     const x = Math.max(0, (canvas.width - w) / 2), y = canvas.height - RES.bottom - px(22);
@@ -709,9 +809,10 @@ async function startCamera() {
   source = "camera";
   stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: { ideal: facing }, frameRate: { ideal: 30 },
-             width: { ideal: innerHeight > innerWidth ? 720 : 1280 }, height: { ideal: innerHeight > innerWidth ? 1280 : 720 } },
+             width: { ideal: innerHeight > innerWidth ? 1080 : 1920 }, height: { ideal: innerHeight > innerWidth ? 1920 : 1080 } },
     audio: false });
   video.srcObject = stream; video.muted = true;
+  view.z = 1; view.cx = 0; view.cy = 0;                     // cada camara abre con el encuadre completo
   await safePlay();
   canvas.classList.remove("contain");
 }
@@ -817,14 +918,15 @@ function drawTracks(now, dtFrame) {
   for (const t of live) {
     const target = predicted(t, now);
     for (let k = 0; k < 4; k++) t.draw[k] += (target[k] - t.draw[k]) * a;
-    const [x, y, w, h] = t.draw;
+    const [x, y, w, h] = t.draw;                                             // coordenadas del video
     if (!t.lastTrail || now - t.lastTrail > 40) { t.trail.push([x + w / 2, y + h / 2]); t.lastTrail = now; }
     if (t.trail.length > 24) t.trail.shift();
+    t.cb = v2cBox(t.draw);                                                   // caja en pantalla
   }
   if (S.net && live.length > 1) {
     const diag = Math.hypot(W, H);
     ctx.lineWidth = lw; ctx.strokeStyle = "rgba(55,230,255,0.28)";
-    const cs = live.map(t => [t.draw[0] + t.draw[2] / 2, t.draw[1] + t.draw[3] / 2]);
+    const cs = live.map(t => [t.cb[0] + t.cb[2] / 2, t.cb[1] + t.cb[3] / 2]);
     const done = new Set();
     ctx.beginPath();
     cs.forEach((p, i) => {
@@ -838,13 +940,16 @@ function drawTracks(now, dtFrame) {
     ctx.stroke();
   }
   for (const t of live) {
-    const [x, y, w, h] = t.draw, col = colorOf(t.label);
+    const [x, y, w, h] = t.cb, col = colorOf(t.label);
     const cx = x + w / 2, cy = y + h / 2;
+    const vcx = t.draw[0] + t.draw[2] / 2, vcy = t.draw[1] + t.draw[3] / 2;
+    if (x + w < 0 || y + h < 0 || x > W || y > H) continue;                  // fuera de la vista (zoom)
     if (S.trails && t.trail.length > 2) {
       ctx.strokeStyle = col; ctx.lineWidth = lw;
-      for (let k = 1; k < t.trail.length; k++) {
-        ctx.globalAlpha = k / t.trail.length * 0.7;
-        ctx.beginPath(); ctx.moveTo(...t.trail[k - 1]); ctx.lineTo(...t.trail[k]); ctx.stroke();
+      const tr = t.trail.map(([u, v]) => v2c(u, v));
+      for (let k = 1; k < tr.length; k++) {
+        ctx.globalAlpha = k / tr.length * 0.7;
+        ctx.beginPath(); ctx.moveTo(...tr[k - 1]); ctx.lineTo(...tr[k]); ctx.stroke();
       }
       ctx.globalAlpha = 1;
     }
@@ -865,7 +970,7 @@ function drawTracks(now, dtFrame) {
     }
     const tiny = w < px(60);
     const l1 = `${t.label} ${Math.round(t.score * 100)}%`;
-    const l2 = tiny ? null : `ID ${t.id} · ${Math.round(cx)},${Math.round(cy)}`;
+    const l2 = tiny ? null : `ID ${t.id} · ${Math.round(vcx)},${Math.round(vcy)}`;
     const ph = l2 ? px(24) : px(14);
     const top = RES.top + px(2);
     plate(x, y - ph - px(2) > top ? y - ph - px(2) : Math.max(top, y + px(2)), [l1, l2], col);
@@ -879,7 +984,7 @@ function drawHands() {
   if (!handRes || performance.now() - handRes.t > 500) return;          // no dibujar manos viejas
   const lw = Math.max(1, px(0.6));
   handRes.hands.forEach(h => {
-    const P = h.pts, g = G[h.label], col = g && g.pinching ? "#ff4fd8" : "#37e6ff";
+    const P = cpts(h), g = G[h.label], col = g && g.pinching ? "#ff4fd8" : "#37e6ff";
     ctx.lineWidth = lw; ctx.strokeStyle = col; ctx.beginPath();
     HAND_EDGES.forEach(([a, b]) => { ctx.moveTo(...P[a]); ctx.lineTo(...P[b]); }); ctx.stroke();
     P.forEach(p => { ctx.beginPath(); ctx.arc(p[0], p[1], px(1.5), 0, 6.3); ctx.stroke(); });
@@ -887,7 +992,8 @@ function drawHands() {
       const [x, y] = P[i];
       ctx.strokeStyle = "#ffffff"; ctx.strokeRect(x - px(3.5), y - px(3.5), px(7), px(7));
       ctx.font = font(6.5, 500); ctx.fillStyle = "#ffb347"; ctx.textBaseline = "bottom";
-      ctx.fillText(`${name} ${Math.round(x)},${Math.round(y)}`, x + px(5), y - px(3));
+      const [vx, vy] = h.vpts[i];
+      ctx.fillText(`${name} ${Math.round(vx)},${Math.round(vy)}`, x + px(5), y - px(3));
     });
   });
 }
@@ -951,9 +1057,14 @@ function loop(now) {
   requestAnimationFrame(loop);
   now = performance.now();
   if (video.readyState < 2 || !video.videoWidth) return;
-  computeCrop();
-  const W = crop.w, H = crop.h;
+  let W, H;
+  if (source === "file") { W = video.videoWidth; H = video.videoHeight; }
+  else {                                     // lienzo con la forma y resolucion de la pantalla
+    const q = Math.min(window.devicePixelRatio || 1, 2, 1600 / Math.max(innerWidth, innerHeight));
+    W = Math.round(innerWidth * q); H = Math.round(innerHeight * q);
+  }
   if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+  computeView();
   if (now - resT > 500) { resT = now; updateReserve(); }
   // texto del mismo tamano fisico en cualquier celular: 1 unidad ~ 1.1 px de pantalla
   U = source === "camera" && RES.k ? RES.k * 1.1 : Math.min(W, H) / 360;
@@ -973,7 +1084,7 @@ function loop(now) {
     chipT = now;
     $("hudChip").innerHTML =
       `<b>${fps.toFixed(0)}</b> FPS · IA <b>${aiRate.toFixed(0)}</b>/s${S.hands ? ` · MANOS <b>${HANDS.rate.toFixed(0)}</b>/s` : ""}` +
-      `<small>${AI.benchmarking ? "midiendo " : ""}${delegate} ${aiMs.toFixed(0)} ms${S.hands ? ` · manos ${HANDS.delegate} ${HANDS.ms.toFixed(0)} ms` : ""}${AI.mode === "main" ? " · COMPAT" : ""}</small>`;
+      `<small>${AI.benchmarking ? "midiendo " : ""}${delegate} ${aiMs.toFixed(0)} ms${S.hands ? ` · manos ${HANDS.delegate} ${HANDS.ms.toFixed(0)} ms` : ""}${AI.mode === "main" ? " · COMPAT" : ""}${view.z > 1.01 ? ` · zoom ${view.z.toFixed(1)}x` : ""}</small>`;
   }
 }
 
@@ -1109,7 +1220,7 @@ window.__visor = { get tracks() { return tracks; }, get fps() { return fps; }, g
                    get aiRate() { return aiRate; }, get delegate() { return delegate; }, get mode() { return AI.mode; },
                    get bench() { return AI.benchResults; }, get ai() { return AI; }, get handsCtl() { return HANDS; },
                    get panels() { return panels; }, set panels(v) { panels = v; }, get handRes() { return handRes; },
-                   get creating() { return creating; }, setHands, updateGestures, G, S };
+                   get creating() { return creating; }, setHands, updateGestures, G, S, view, v2c, setZoom };
 </script>
 </body>
 </html>
