@@ -207,7 +207,7 @@
 //     pero igual separada del dibujo.
 // ============================================================================
 const VER = "1.0.1";
-const APPV = "7";                                   // sube con cada version: evita workers viejos en cache
+const APPV = "8";                                   // sube con cada version: evita workers viejos en cache
 const CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const MODELS = {
   lite0: ["models/efficientdet_lite0.tflite",
@@ -420,9 +420,11 @@ const hctx = hsmall.getContext("2d");
 const HANDS = {
   worker: null, ready: false, starting: false, busy: false, delegate: "—", ms: 0, rate: 0, last: 0, frameId: 0, error: "",
 
-  async start() {
+  async start(prefer) {
     if (this.ready || this.starting) return;
     this.starting = true;
+    const want = prefer || (S.engine !== "auto" ? S.engine : ((S.pref && S.pref.hands) || "CPU"));
+    this.bench = (S.engine === "auto" && !(S.pref && S.pref.hands) && !prefer) ? { times: [], results: {} } : this.bench;
     try {
       await new Promise((ok, bad) => {
         const w = new Worker(`detector-worker.js?v=${APPV}`, { type: "module" });
@@ -436,7 +438,7 @@ const HANDS = {
         };
         w.onerror = e => { e.preventDefault(); clearTimeout(t); w.terminate(); bad(new Error(e.message || "worker")); };
         w.postMessage({ type: "init", task: "hands", urls: absUrls(MODELS.hands),
-                        prefer: S.engine !== "auto" ? S.engine : "CPU" });   // CPU: no compite con los objetos en la GPU
+                        prefer: want });
       });
       this.ready = true;
     } catch (e) {
@@ -446,7 +448,7 @@ const HANDS = {
 
   stop() {
     if (this.worker) this.worker.terminate();
-    this.worker = null; this.ready = false; this.busy = false; handRes = null;
+    this.worker = null; this.ready = false; this.busy = false; handRes = null; this.last = 0;
   },
 
   async pump() {
@@ -468,6 +470,27 @@ const HANDS = {
     if (this.last) this.rate = this.rate * 0.8 + (1000 / Math.max(1, now - this.last)) * 0.2;
     this.last = now;
     setHands(m.hands || [], now, this.sentCrop);
+    if (this.bench) this.benchStep(m.ms, m.delegate);
+  },
+
+  // autoajuste de manos: empieza en CPU; si tarda mas de 90 ms prueba la GPU
+  async benchStep(ms, d) {
+    const b = this.bench;
+    b.times.push(ms);
+    if (b.times.length < 10) return;
+    const t = b.times.slice(3).sort((x, y) => x - y);
+    b.results[d] = Math.round(t[Math.floor(t.length / 2)]);
+    b.times = [];
+    const other = d === "GPU" ? "CPU" : "GPU";
+    let best = d;
+    if (b.results[other] === undefined && b.results[d] > 90) {
+      this.bench = b; this.stop(); await this.start(other); return;         // medir el otro motor
+    }
+    if (b.results[other] !== undefined) best = b.results.GPU <= b.results.CPU ? "GPU" : "CPU";
+    S.pref = S.pref || {}; S.pref.hands = best; save();
+    this.benchResults = { ...b.results, elegido: best };
+    this.bench = null;
+    if (best !== this.delegate) { this.stop(); await this.start(best); }
   },
 };
 
@@ -607,7 +630,7 @@ function updateGestures(now) {
 // Zoom 1 = encuadre completo de la camara (sin recorte). Todo (objetos, manos)
 // se guarda en coordenadas del VIDEO y se convierte a la pantalla al dibujar,
 // asi el zoom no descuadra nada.
-const view = { z: 1, cx: 0, cy: 0, toastT: 0 };
+const view = { z: 1, cx: 0, cy: 0, toastT: 0, base: 1, init: false };
 const MAXZ = 8;
 let win = { x: 0, y: 0, w: 1, h: 1 };          // ventana visible (coords de video; puede salirse: franjas)
 let crop = { x: 0, y: 0, w: 0, h: 0 };         // parte real del video dentro de la ventana
@@ -619,6 +642,15 @@ function fullWin() {
 function computeView() {
   const vw = video.videoWidth, vh = video.videoHeight;
   if (source === "file") { win = { x: 0, y: 0, w: vw, h: vh }; crop = { ...win }; return; }
+  if (view.init) {
+    // misma orientacion que la pantalla: encuadre completo (casi llena la pantalla).
+    // Orientacion distinta (video horizontal con el celular vertical): llenar la
+    // pantalla en vez de mostrar una franja; con los dedos se puede alejar.
+    const f0 = fullWin(), cover = Math.max(f0.w / vw, f0.h / vh);
+    const mismatch = (vh > vw) !== (canvas.height > canvas.width);
+    view.base = mismatch ? Math.min(MAXZ, cover) : 1;
+    view.z = view.base; view.cx = vw / 2; view.cy = vh / 2; view.init = false;
+  }
   const f = fullWin(), w = f.w / view.z, h = f.h / view.z;
   if (!view.cx) { view.cx = vw / 2; view.cy = vh / 2; }
   const cl = (c, size, full) => size >= full ? full / 2 : Math.min(full - size / 2, Math.max(size / 2, c));
@@ -643,6 +675,8 @@ function v2cBox(b) {
   let X = (b[0] - win.x) * sx; if (isMirror()) X = canvas.width - X - w;
   return [X, (b[1] - win.y) * sy, w, b[3] * sy];
 }
+// zoom como lo muestra la camara del celular: la vista inicial es 1x
+const zoomShown = () => view.z / (view.base || 1);
 function setZoom(z, cx, cy) {
   view.z = Math.min(MAXZ, Math.max(1, z));
   if (cx !== undefined) { view.cx = cx; view.cy = cy; }
@@ -673,7 +707,11 @@ canvas.addEventListener("pointerdown", e => {
   touchPts.set(e.pointerId, toCanvas(e));
   if (touchPts.size === 1) {                                    // doble toque: encuadre completo
     const now = performance.now();
-    if (now - lastTap < 320) { setZoom(1, video.videoWidth / 2, video.videoHeight / 2); lastTap = 0; } else lastTap = now;
+    // doble toque: vuelve al encuadre inicial; si ya esta ahi, muestra todo el cuadro
+    if (now - lastTap < 320) {
+      const b = view.base || 1;
+      setZoom(Math.abs(view.z - b) < 0.05 ? 1 : b, video.videoWidth / 2, video.videoHeight / 2); lastTap = 0;
+    } else lastTap = now;
   }
   if (touchPts.size === 2) {
     const [a, b] = [...touchPts.values()], mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
@@ -781,7 +819,7 @@ function drawGestureHUD(now) {
     ctx.beginPath(); ctx.arc(g.pt[0], g.pt[1], px(7), 0, 6.3); ctx.stroke();
     ctx.fillStyle = "#ff4fd8"; ctx.beginPath(); ctx.arc(g.pt[0], g.pt[1], px(1.5), 0, 6.3); ctx.fill();
   }
-  const msg = now - view.toastT < 1200 ? `ZOOM ${view.z.toFixed(1)}x`
+  const msg = now - view.toastT < 1200 ? `ZOOM ${zoomShown().toFixed(1)}x`
             : now - gestureMsgT < 1600 ? gestureMsg
             : (handRes && handRes.hands.length && now - handRes.t < 500
                ? (S.gmode === "zoom" ? "Modo zoom: pellizca con dos manos y sepáralas"
@@ -809,10 +847,10 @@ async function startCamera() {
   source = "camera";
   stream = await navigator.mediaDevices.getUserMedia({
     video: { facingMode: { ideal: facing }, frameRate: { ideal: 30 },
-             width: { ideal: innerHeight > innerWidth ? 1080 : 1920 }, height: { ideal: innerHeight > innerWidth ? 1920 : 1080 } },
+             width: { ideal: 1280 }, height: { ideal: 720 } },
     audio: false });
   video.srcObject = stream; video.muted = true;
-  view.z = 1; view.cx = 0; view.cy = 0;                     // cada camara abre con el encuadre completo
+  view.z = 1; view.cx = 0; view.cy = 0; view.init = true;   // el encuadre inicial se decide con el primer cuadro
   await safePlay();
   canvas.classList.remove("contain");
 }
@@ -1084,7 +1122,7 @@ function loop(now) {
     chipT = now;
     $("hudChip").innerHTML =
       `<b>${fps.toFixed(0)}</b> FPS · IA <b>${aiRate.toFixed(0)}</b>/s${S.hands ? ` · MANOS <b>${HANDS.rate.toFixed(0)}</b>/s` : ""}` +
-      `<small>${AI.benchmarking ? "midiendo " : ""}${delegate} ${aiMs.toFixed(0)} ms${S.hands ? ` · manos ${HANDS.delegate} ${HANDS.ms.toFixed(0)} ms` : ""}${AI.mode === "main" ? " · COMPAT" : ""}${view.z > 1.01 ? ` · zoom ${view.z.toFixed(1)}x` : ""}</small>`;
+      `<small>${AI.benchmarking ? "midiendo " : ""}${delegate} ${aiMs.toFixed(0)} ms${S.hands ? ` · manos ${HANDS.delegate} ${HANDS.ms.toFixed(0)} ms` : ""}${AI.mode === "main" ? " · COMPAT" : ""}${Math.abs(zoomShown() - 1) > 0.02 ? ` · zoom ${zoomShown().toFixed(1)}x` : ""}</small>`;
   }
 }
 
@@ -1187,8 +1225,8 @@ function diagText() {
     AI.fallbackReason ? `Motivo del respaldo: ${AI.fallbackReason}` : "",
     prev ? `Último respaldo: ${prev}` : "",
     `Video ${fps.toFixed(0)} FPS · IA ${aiRate.toFixed(1)}/s · ${aiMs.toFixed(0)} ms`,
-    `Manos: ${S.hands ? (HANDS.ready ? `hilo propio · ${HANDS.delegate} · ${HANDS.rate.toFixed(0)}/s · ${HANDS.ms.toFixed(0)} ms` : (HANDS.error || "cargando")) : "apagadas"}`,
-    `Cámara: ${video.videoWidth}x${video.videoHeight}`,
+    `Manos: ${S.hands ? (HANDS.ready ? `hilo propio · ${HANDS.delegate} · ${HANDS.rate.toFixed(0)}/s · ${HANDS.ms.toFixed(0)} ms${HANDS.benchResults ? " · medición " + JSON.stringify(HANDS.benchResults) : ""}` : (HANDS.error || "cargando")) : "apagadas"}`,
+    `Video de la cámara: ${video.videoWidth}x${video.videoHeight} · zoom ${view.z.toFixed(2)}x`,
     `GPU: ${gl}`,
     `Workers de módulo: ${typeof OffscreenCanvas !== "undefined" ? "OffscreenCanvas sí" : "sin OffscreenCanvas"}`,
     `Navegador: ${navigator.userAgent}`,
@@ -1199,6 +1237,7 @@ $("rebench").onclick = async () => {
   S.pref = {}; S.engine = "auto"; save(); syncSettings();
   AI.ready = false; AI.model = ""; $("settings").hidden = true;
   try { await AI.init(); status(""); } catch (e) { status("No se pudo reiniciar la IA."); }
+  if (S.hands) { HANDS.bench = null; HANDS.stop(); HANDS.start(); }
 };
 $("setBtn").onclick = () => { syncSettings(); $("diag").textContent = diagText(); $("settings").hidden = false; };
 $("closeSet").onclick = async () => { $("settings").hidden = true;
