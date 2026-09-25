@@ -1,0 +1,15 @@
+{
+  "name": "Visor Scan",
+  "short_name": "Visor",
+  "description": "Deteccion de objetos en tiempo real sobre la camara, con grabacion.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "orientation": "any",
+  "background_color": "#05090d",
+  "theme_color": "#05090d",
+  "icons": [
+    {"src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+    {"src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"}
+  ]
+}

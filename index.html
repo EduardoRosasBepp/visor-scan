@@ -1,0 +1,636 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#05090d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Visor Scan</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --ground: #05090d;
+    --panel: rgba(6, 14, 20, 0.72);
+    --line: rgba(55, 230, 255, 0.35);
+    --cyan: #37e6ff;
+    --amber: #ffb347;
+    --rec: #ff3b5c;
+    --text: #e6f6ff;
+    --muted: #7f9aa8;
+    --display: "Chakra Petch", "Segoe UI", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; background: var(--ground); color: var(--text);
+    font-family: var(--mono); overflow: hidden; overscroll-behavior: none; }
+  [hidden] { display: none !important; }
+  #stage { position: fixed; inset: 0; display: grid; place-items: center; background: var(--ground); }
+  /* el video queda a tamano completo DETRAS del lienzo: si estuviera oculto,
+     el navegador lo pausaria para ahorrar energia */
+  #view { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; object-fit: cover; display: block; background: var(--ground); }
+  #view.contain { object-fit: contain; }
+  video#src { position: absolute; inset: 0; z-index: 0; width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
+
+  /* ---- controles ---- */
+  .bar { position: fixed; left: 0; right: 0; display: flex; align-items: center;
+    justify-content: space-between; gap: 12px; padding-inline: 16px; z-index: 5; pointer-events: none; }
+  .bar > * { pointer-events: auto; }
+  #top { top: 0; padding-top: calc(env(safe-area-inset-top, 0px) + 10px); }
+  #bottom { bottom: 0; padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 18px); justify-content: space-around; }
+  .chip { font: 500 12px/1 var(--mono); letter-spacing: .06em; color: var(--text);
+    background: var(--panel); border: 1px solid var(--line); padding: 8px 10px; border-radius: 3px;
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+  .ibtn { width: 52px; height: 52px; border-radius: 50%; border: 1px solid var(--line);
+    background: var(--panel); color: var(--text); display: grid; place-items: center;
+    backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); cursor: pointer; }
+  .ibtn svg { width: 24px; height: 24px; stroke: currentColor; fill: none; stroke-width: 1.6; }
+  .ibtn:focus-visible, .btn:focus-visible, .opt:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+  #recBtn { width: 78px; height: 78px; border-radius: 50%; border: 3px solid var(--text);
+    background: transparent; display: grid; place-items: center; cursor: pointer; padding: 0; }
+  #recBtn span { width: 58px; height: 58px; border-radius: 50%; background: var(--rec);
+    transition: all .2s ease; }
+  #recBtn.on span { width: 30px; height: 30px; border-radius: 6px; }
+  #recTime { color: var(--rec); display: none; }
+  #recTime.on { display: inline-block; }
+
+  /* ---- hojas ---- */
+  .sheet { position: fixed; inset: 0; z-index: 10; display: grid; align-items: end;
+    background: rgba(0,0,0,.55); }
+  .sheet .card { background: #0a141b; border-top: 1px solid var(--line); padding: 20px 16px;
+    padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 20px); display: grid; gap: 16px;
+    max-height: 88vh; overflow-y: auto; }
+  .sheet h2 { font: 600 20px/1.2 var(--display); letter-spacing: .04em; margin: 0; text-transform: uppercase; }
+  .sheet p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+  .row { display: grid; gap: 8px; }
+  .row label { font-size: 11px; letter-spacing: .12em; color: var(--muted); text-transform: uppercase; }
+  .seg { display: flex; gap: 8px; flex-wrap: wrap; }
+  .opt { flex: 1 1 0; min-width: 96px; padding: 12px 10px; border: 1px solid var(--line); background: transparent;
+    color: var(--text); font: 500 13px var(--mono); border-radius: 3px; cursor: pointer; }
+  .opt[aria-pressed="true"] { border-color: var(--cyan); background: rgba(55,230,255,.12); color: var(--cyan); }
+  input[type=range] { width: 100%; accent-color: var(--cyan); }
+  .btn { padding: 14px 16px; border-radius: 3px; border: 1px solid var(--cyan); background: var(--cyan);
+    color: #031018; font: 600 15px var(--display); letter-spacing: .08em; text-transform: uppercase; cursor: pointer; }
+  .btn.ghost { background: transparent; color: var(--text); border-color: var(--line); }
+  .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  #preview video, #preview img { width: 100%; max-height: 52vh; background: #000; border: 1px solid var(--line); object-fit: contain; }
+
+  /* ---- inicio ---- */
+  #start { position: fixed; inset: 0; z-index: 20; display: grid; align-content: center; gap: 22px;
+    padding: calc(env(safe-area-inset-top,0px) + 24px) 20px calc(env(safe-area-inset-bottom,0px) + 24px);
+    background:
+      linear-gradient(rgba(55,230,255,.06) 1px, transparent 1px) 0 0 / 28px 28px,
+      linear-gradient(90deg, rgba(55,230,255,.06) 1px, transparent 1px) 0 0 / 28px 28px,
+      var(--ground); }
+  #start .brand { font: 600 clamp(40px, 12vw, 64px)/0.95 var(--display); letter-spacing: .02em; margin: 0; text-transform: uppercase; }
+  #start .brand em { font-style: normal; color: var(--cyan); }
+  #start .tag { color: var(--muted); font-size: 13px; line-height: 1.6; max-width: 34ch; margin: 0; }
+  #start .scenes { display: flex; gap: 8px; flex-wrap: wrap; }
+  #start .scenes span { font-size: 11px; letter-spacing: .1em; border: 1px solid var(--line); padding: 6px 8px; color: var(--cyan); }
+  #start .actions { display: grid; gap: 10px; max-width: 420px; }
+  #status { font-size: 12px; color: var(--amber); min-height: 1.4em; margin: 0; }
+  #fileIn { display: none; }
+  @media (prefers-reduced-motion: reduce) { #recBtn span { transition: none; } }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="view"></canvas>
+  <video id="src" playsinline muted></video>
+</div>
+
+<div class="bar" id="top" hidden>
+  <span class="chip" id="hudChip">VISOR · —</span>
+  <span class="chip" id="recTime">● REC 00:00</span>
+  <button class="ibtn" id="setBtn" aria-label="Ajustes">
+    <svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+  </button>
+</div>
+
+<div class="bar" id="bottom" hidden>
+  <button class="ibtn" id="flipBtn" aria-label="Cambiar cámara">
+    <svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><path d="M9 13a3 3 0 0 1 5.2-2M15 13a3 3 0 0 1-5.2 2"/><path d="M14 9.5l.4 1.7-1.7.3M10 16.5l-.4-1.7 1.7-.3"/></svg>
+  </button>
+  <button id="recBtn" aria-label="Grabar video"><span></span></button>
+  <button class="ibtn" id="shotBtn" aria-label="Tomar foto">
+    <svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="13" rx="1"/><circle cx="12" cy="12.5" r="3.5"/><path d="M8 6l1.5-2h5L16 6"/></svg>
+  </button>
+</div>
+
+<section id="start">
+  <h1 class="brand">Visor<br><em>Scan</em></h1>
+  <p class="tag">Detección de objetos en tiempo real sobre tu cámara. Graba el metro, la biblioteca o el parque y guarda el video con el análisis encima.</p>
+  <div class="scenes" aria-hidden="true"><span>PERSONA</span><span>TREN</span><span>LIBRO</span><span>PERRO</span><span>BICICLETA</span><span>+75</span></div>
+  <div class="actions">
+    <button class="btn" id="camBtn">Abrir cámara</button>
+    <button class="btn ghost" id="galBtn">Procesar video de la galería</button>
+    <input type="file" id="fileIn" accept="video/*">
+  </div>
+  <p id="status" role="status"></p>
+</section>
+
+<section class="sheet" id="settings" hidden>
+  <div class="card">
+    <h2>Ajustes</h2>
+    <div class="row"><label>Modelo</label>
+      <div class="seg" data-key="model">
+        <button class="opt" data-v="lite0">Rápido</button>
+        <button class="opt" data-v="lite2">Preciso</button>
+      </div></div>
+    <div class="row"><label>Capas</label>
+      <div class="seg" data-multi>
+        <button class="opt" data-k="trails">Rastro</button>
+        <button class="opt" data-k="net">Red</button>
+        <button class="opt" data-k="counts">Contador</button>
+        <button class="opt" data-k="hands">Manos</button>
+      </div></div>
+    <div class="row"><label for="conf">Confianza mínima <span id="confV"></span></label>
+      <input type="range" id="conf" min="20" max="80" step="5"></div>
+    <div class="row"><label>Audio al grabar</label>
+      <div class="seg" data-key="audio">
+        <button class="opt" data-v="on">Con audio</button>
+        <button class="opt" data-v="off">Sin audio</button>
+      </div></div>
+    <button class="btn ghost" id="closeSet">Listo</button>
+  </div>
+</section>
+
+<section class="sheet" id="preview" hidden>
+  <div class="card">
+    <h2 id="pvTitle">Video listo</h2>
+    <div id="pvMedia"></div>
+    <p id="pvInfo"></p>
+    <div class="btns">
+      <button class="btn" id="pvShare">Guardar / compartir</button>
+      <button class="btn ghost" id="pvDl">Descargar</button>
+    </div>
+    <button class="btn ghost" id="pvClose">Cerrar</button>
+  </div>
+</section>
+
+<script type="module">
+import { FilesetResolver, ObjectDetector, HandLandmarker }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs";
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm";
+const MODELS = {
+  lite0: ["models/efficientdet_lite0.tflite",
+          "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/latest/efficientdet_lite0.tflite"],
+  lite2: ["models/efficientdet_lite2.tflite",
+          "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float16/latest/efficientdet_lite2.tflite"],
+  hands: ["models/hand_landmarker.task",
+          "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"],
+};
+
+const ES = {person:"PERSONA",bicycle:"BICICLETA",car:"AUTO",motorcycle:"MOTO",airplane:"AVION",bus:"AUTOBUS",
+  train:"TREN",truck:"CAMION",boat:"BOTE","traffic light":"SEMAFORO","fire hydrant":"HIDRANTE","stop sign":"ALTO",
+  "parking meter":"PARQUIMETRO",bench:"BANCA",bird:"PAJARO",cat:"GATO",dog:"PERRO",horse:"CABALLO",sheep:"OVEJA",
+  cow:"VACA",elephant:"ELEFANTE",bear:"OSO",zebra:"CEBRA",giraffe:"JIRAFA",backpack:"MOCHILA",umbrella:"PARAGUAS",
+  handbag:"BOLSO",tie:"CORBATA",suitcase:"MALETA",frisbee:"FRISBEE",skis:"ESQUIS",snowboard:"SNOWBOARD",
+  "sports ball":"BALON",kite:"PAPALOTE","baseball bat":"BATE","baseball glove":"GUANTE",skateboard:"PATINETA",
+  surfboard:"TABLA SURF","tennis racket":"RAQUETA",bottle:"BOTELLA","wine glass":"COPA",cup:"VASO",fork:"TENEDOR",
+  knife:"CUCHILLO",spoon:"CUCHARA",bowl:"TAZON",banana:"PLATANO",apple:"MANZANA",sandwich:"SANDWICH",orange:"NARANJA",
+  broccoli:"BROCOLI",carrot:"ZANAHORIA","hot dog":"HOT DOG",pizza:"PIZZA",donut:"DONA",cake:"PASTEL",chair:"SILLA",
+  couch:"SILLON","potted plant":"PLANTA",bed:"CAMA","dining table":"MESA",toilet:"INODORO",tv:"PANTALLA",
+  laptop:"LAPTOP",mouse:"MOUSE",remote:"CONTROL",keyboard:"TECLADO","cell phone":"CELULAR",microwave:"MICROONDAS",
+  oven:"HORNO",toaster:"TOSTADOR",sink:"LAVABO",refrigerator:"REFRI",book:"LIBRO",clock:"RELOJ",vase:"FLORERO",
+  scissors:"TIJERAS","teddy bear":"PELUCHE","hair drier":"SECADORA",toothbrush:"CEPILLO"};
+const GROUP = {PERSONA:"#37e6ff"};
+["BICICLETA","AUTO","MOTO","AVION","AUTOBUS","TREN","CAMION","BOTE"].forEach(k => GROUP[k] = "#ffb347");
+["PAJARO","GATO","PERRO","CABALLO","OVEJA","VACA","ELEFANTE","OSO","CEBRA","JIRAFA"].forEach(k => GROUP[k] = "#6dff9e");
+["SEMAFORO","HIDRANTE","ALTO","PARQUIMETRO","BANCA"].forEach(k => GROUP[k] = "#ffe066");
+const OTHER = "#d59bff";
+const colorOf = l => GROUP[l] || OTHER;
+
+// ---------------------------------------------------------------- estado
+const $ = id => document.getElementById(id);
+const canvas = $("view"), ctx = canvas.getContext("2d");
+const video = $("src");
+const S = { model: "lite0", trails: true, net: true, counts: true, hands: false, conf: 0.4, audio: "on" };
+try { Object.assign(S, JSON.parse(localStorage.getItem("visor") || "{}")); } catch (e) {}
+const save = () => { try { localStorage.setItem("visor", JSON.stringify(S)); } catch (e) {} };
+
+let fileset = null, detector = null, handLm = null, loadedModel = "";
+let running = false, facing = "environment", stream = null, source = "camera";
+let tracks = [], nextId = 1000, seenIds = new Set(), seenByLabel = {};
+let lastTs = 0, fps = 0, lastFrameT = performance.now(), detMs = 0, handRes = null;
+let rec = null, recChunks = [], recStart = 0, micStream = null, wakeLock = null;
+
+const status = t => { $("status").textContent = t; };
+
+// ---------------------------------------------------------------- modelos
+async function loadModel(url2, create) {
+  for (const url of url2) {
+    for (const delegate of ["GPU", "CPU"]) {
+      try { return await create(url, delegate); } catch (e) { console.warn("fallo", url, delegate, e); }
+    }
+  }
+  throw new Error("No se pudo cargar el modelo");
+}
+async function ensureDetector() {
+  if (!fileset) { status("Cargando motor de visión…"); fileset = await FilesetResolver.forVisionTasks(WASM); }
+  if (loadedModel !== S.model) {
+    status("Cargando modelo " + (S.model === "lite2" ? "preciso" : "rápido") + "…");
+    if (detector) detector.close();
+    detector = await loadModel(MODELS[S.model], (url, delegate) => ObjectDetector.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: url, delegate }, runningMode: "VIDEO",
+      scoreThreshold: 0.2, maxResults: 30 }));
+    loadedModel = S.model; tracks = [];
+  }
+  if (S.hands && !handLm) {
+    status("Cargando manos…");
+    handLm = await loadModel(MODELS.hands, (url, delegate) => HandLandmarker.createFromOptions(fileset, {
+      baseOptions: { modelAssetPath: url, delegate }, runningMode: "VIDEO", numHands: 2 }));
+  }
+  status("");
+}
+
+// ---------------------------------------------------------------- fuentes
+// play() puede rechazarse si el navegador pausa el video (ahorro de energia);
+// no es fatal: se reanuda al volver a la pagina o al tocar la pantalla.
+async function safePlay() {
+  try { await video.play(); }
+  catch (e) { if (e.name !== "AbortError" && e.name !== "NotAllowedError") throw e; console.warn("play pospuesto:", e.message); }
+}
+const resume = () => { if (running && video.paused && !video.ended && (video.srcObject || video.src)) video.play().catch(() => {}); };
+document.addEventListener("pointerdown", resume);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") resume(); });
+setInterval(resume, 1500);
+
+async function startCamera() {
+  stopSource();
+  source = "camera";
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+    audio: false });
+  video.srcObject = stream; video.muted = true;
+  await safePlay();
+  canvas.classList.remove("contain");
+}
+async function startFile(file) {
+  stopSource();
+  source = "file";
+  video.srcObject = null;
+  video.src = URL.createObjectURL(file);
+  video.loop = false; video.muted = true;
+  await new Promise((ok, bad) => { video.onloadedmetadata = ok; video.onerror = () => bad(new Error("video")); });
+  await safePlay();
+  canvas.classList.add("contain");
+}
+function stopSource() {
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (video.src && video.src.startsWith("blob:")) URL.revokeObjectURL(video.src);
+  video.removeAttribute("src"); video.srcObject = null;
+}
+
+async function launch(kind, file) {
+  try {
+    $("camBtn").disabled = $("galBtn").disabled = true;
+    await ensureDetector();
+    if (kind === "camera") await startCamera(); else await startFile(file);
+    $("start").hidden = true; $("top").hidden = false; $("bottom").hidden = false;
+    $("flipBtn").hidden = kind !== "camera";
+    try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {}
+    if (!running) { running = true; loop(); }
+    if (kind === "file") {                          // procesa y graba el video completo
+      const go = () => { video.currentTime = 0; startRecording(true); };
+      if (!video.paused) go();
+      else video.addEventListener("playing", go, { once: true });
+    }
+  } catch (e) {
+    console.error(e);
+    status(kind === "camera"
+      ? "No se pudo abrir la cámara. Revisa que el navegador tenga permiso de cámara y que la página se abra con https."
+      : "No se pudo abrir ese video. Prueba con otro archivo.");
+  } finally { $("camBtn").disabled = $("galBtn").disabled = false; }
+}
+
+// ---------------------------------------------------------------- seguimiento
+const iou = (a, b) => {
+  const x0 = Math.max(a[0], b[0]), y0 = Math.max(a[1], b[1]);
+  const x1 = Math.min(a[0] + a[2], b[0] + b[2]), y1 = Math.min(a[1] + a[3], b[1] + b[3]);
+  const i = Math.max(0, x1 - x0) * Math.max(0, y1 - y0);
+  const u = a[2] * a[3] + b[2] * b[3] - i;
+  return u > 0 ? i / u : 0;
+};
+function updateTracks(dets, now, W) {
+  const mirror = source === "camera" && facing === "user";
+  const list = dets.filter(d => d.categories[0].score >= S.conf).map(d => {
+    const b = d.boundingBox, c = d.categories[0];
+    const x = mirror ? W - b.originX - b.width : b.originX;
+    return { box: [x, b.originY, b.width, b.height], label: ES[c.categoryName] || c.categoryName.toUpperCase(), score: c.score };
+  });
+  const used = new Set();
+  for (const t of tracks) {
+    let best = 0.2, bi = -1;
+    list.forEach((d, i) => { if (!used.has(i) && d.label === t.label) { const v = iou(t.box, d.box); if (v > best) { best = v; bi = i; } } });
+    if (bi >= 0) {
+      const d = list[bi]; used.add(bi);
+      t.box = d.box; t.score = t.score * 0.6 + d.score * 0.4; t.seen = now; t.hits++;
+      if (t.hits === 3) { seenIds.add(t.id); seenByLabel[t.label] = (seenByLabel[t.label] || 0) + 1; }
+    }
+  }
+  list.forEach((d, i) => {
+    if (!used.has(i)) tracks.push({ id: nextId++, label: d.label, box: d.box, draw: d.box.slice(), score: d.score,
+      seen: now, born: now, hits: 1, trail: [] });
+  });
+  tracks = tracks.filter(t => now - t.seen < 700);
+}
+
+// ---------------------------------------------------------------- dibujo
+let U = 2;                                   // unidad de escala del HUD
+const px = n => n * U;
+function font(size, weight = 500, fam = "IBM Plex Mono") { return `${weight} ${px(size)}px "${fam}", ui-monospace, monospace`; }
+
+function plate(x, y, lines, col) {
+  ctx.font = font(9.5, 500);
+  const w1 = ctx.measureText(lines[0]).width;
+  ctx.font = font(7.5, 400);
+  const w2 = lines[1] ? ctx.measureText(lines[1]).width : 0;
+  const w = Math.max(w1, w2) + px(10), h = lines[1] ? px(24) : px(14);
+  const W = canvas.width;
+  x = Math.min(Math.max(0, x), W - w);
+  ctx.fillStyle = "rgba(4,10,14,0.66)"; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = col; ctx.fillRect(x, y, px(1.5), h);
+  ctx.textBaseline = "top";
+  ctx.font = font(9.5, 500); ctx.fillStyle = col; ctx.fillText(lines[0], x + px(5), y + px(2));
+  if (lines[1]) { ctx.font = font(7.5, 400); ctx.fillStyle = "#e6f6ff"; ctx.fillText(lines[1], x + px(5), y + px(14)); }
+  return h;
+}
+
+function drawTracks(now) {
+  const W = canvas.width, H = canvas.height, lw = Math.max(1, px(0.6));
+  const live = tracks.filter(t => t.hits >= 2);
+  for (const t of live) {
+    for (let k = 0; k < 4; k++) t.draw[k] += (t.box[k] - t.draw[k]) * 0.5;
+    const [x, y, w, h] = t.draw;
+    const cx = x + w / 2, cy = y + h / 2;
+    t.trail.push([cx, cy]); if (t.trail.length > 24) t.trail.shift();
+  }
+  // red de conexiones entre objetos cercanos
+  if (S.net && live.length > 1) {
+    const diag = Math.hypot(W, H);
+    ctx.lineWidth = lw; ctx.strokeStyle = "rgba(55,230,255,0.28)";
+    const cs = live.map(t => [t.draw[0] + t.draw[2] / 2, t.draw[1] + t.draw[3] / 2]);
+    const done = new Set();
+    cs.forEach((a, i) => {
+      cs.map((b, j) => [j, Math.hypot(a[0] - b[0], a[1] - b[1])]).filter(([j]) => j !== i)
+        .sort((p, q) => p[1] - q[1]).slice(0, 2).forEach(([j, d]) => {
+          const key = i < j ? i + "-" + j : j + "-" + i;
+          if (done.has(key) || d > diag * 0.35) return; done.add(key);
+          ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(cs[j][0], cs[j][1]); ctx.stroke();
+        });
+    });
+  }
+  for (const t of live) {
+    const [x, y, w, h] = t.draw, col = colorOf(t.label);
+    const cx = x + w / 2, cy = y + h / 2;
+    // rastro
+    if (S.trails && t.trail.length > 2) {
+      for (let k = 1; k < t.trail.length; k++) {
+        ctx.strokeStyle = col; ctx.globalAlpha = k / t.trail.length * 0.7; ctx.lineWidth = lw;
+        ctx.beginPath(); ctx.moveTo(...t.trail[k - 1]); ctx.lineTo(...t.trail[k]); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+    // caja fina + esquinas
+    ctx.lineWidth = lw; ctx.strokeStyle = col; ctx.globalAlpha = 0.55; ctx.strokeRect(x, y, w, h); ctx.globalAlpha = 1;
+    const L = Math.max(px(5), Math.min(w, h) * 0.18);
+    ctx.lineWidth = Math.max(1.5, px(1.1)); ctx.strokeStyle = "#ffffff";
+    ctx.beginPath();
+    [[x, y, 1, 1], [x + w, y, -1, 1], [x, y + h, 1, -1], [x + w, y + h, -1, -1]].forEach(([a, b, dx, dy]) => {
+      ctx.moveTo(a + dx * L, b); ctx.lineTo(a, b); ctx.lineTo(a, b + dy * L);
+    });
+    ctx.stroke();
+    // centro
+    ctx.lineWidth = lw; ctx.strokeStyle = col;
+    ctx.beginPath(); ctx.moveTo(cx - px(3), cy); ctx.lineTo(cx + px(3), cy); ctx.moveTo(cx, cy - px(3)); ctx.lineTo(cx, cy + px(3)); ctx.stroke();
+    // animacion de enganche al aparecer
+    const age = now - t.born;
+    if (age < 450) {
+      const k = age / 450, g = (1 - k) * px(18);
+      ctx.globalAlpha = 1 - k; ctx.strokeStyle = col; ctx.strokeRect(x - g, y - g, w + 2 * g, h + 2 * g); ctx.globalAlpha = 1;
+    }
+    // placa
+    const small = w < px(60);
+    const l1 = `${t.label} ${Math.round(t.score * 100)}%`;
+    const l2 = small ? null : `ID ${t.id} · ${Math.round(cx)},${Math.round(cy)}`;
+    const ph = l2 ? px(24) : px(14);
+    const py = y - ph - px(2) > px(4) ? y - ph - px(2) : y + px(2);
+    plate(x, py, [l1, l2], col);
+  }
+}
+
+const HAND_EDGES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+const FINGERS = [["THUMB",4],["INDEX",8],["MIDDLE",12],["RING",16],["PINKY",20]];
+function drawHands() {
+  if (!handRes || !handRes.landmarks) return;
+  const W = canvas.width, H = canvas.height, mirror = source === "camera" && facing === "user";
+  ctx.lineWidth = Math.max(1, px(0.6));
+  handRes.landmarks.forEach((lm, hi) => {
+    const P = lm.map(p => [(mirror ? 1 - p.x : p.x) * W, p.y * H]);
+    ctx.strokeStyle = "#37e6ff"; ctx.beginPath();
+    HAND_EDGES.forEach(([a, b]) => { ctx.moveTo(...P[a]); ctx.lineTo(...P[b]); }); ctx.stroke();
+    P.forEach(p => { ctx.beginPath(); ctx.arc(p[0], p[1], px(1.6), 0, 6.3); ctx.stroke(); });
+    FINGERS.forEach(([name, i]) => {
+      const [x, y] = P[i];
+      ctx.strokeStyle = "#ffffff"; ctx.strokeRect(x - px(4), y - px(4), px(8), px(8));
+      ctx.font = font(7, 500); ctx.fillStyle = "#ffb347"; ctx.textBaseline = "bottom";
+      ctx.fillText(`${name} ${Math.round(x)},${Math.round(y)}`, x + px(6), y - px(3));
+    });
+  });
+}
+
+function drawFrameHUD(now) {
+  const W = canvas.width, H = canvas.height;
+  // esquinas del visor
+  const m = px(10), L = px(22);
+  ctx.strokeStyle = "rgba(230,246,255,0.7)"; ctx.lineWidth = Math.max(1, px(0.7));
+  ctx.beginPath();
+  [[m, m, 1, 1], [W - m, m, -1, 1], [m, H - m, 1, -1], [W - m, H - m, -1, -1]].forEach(([a, b, dx, dy]) => {
+    ctx.moveTo(a + dx * L, b); ctx.lineTo(a, b); ctx.lineTo(a, b + dy * L);
+  });
+  ctx.stroke();
+  // linea de barrido
+  const sy = ((now / 2600) % 1) * H;
+  const g = ctx.createLinearGradient(0, sy - px(30), 0, sy);
+  g.addColorStop(0, "rgba(55,230,255,0)"); g.addColorStop(1, "rgba(55,230,255,0.10)");
+  ctx.fillStyle = g; ctx.fillRect(0, sy - px(30), W, px(30));
+  ctx.fillStyle = "rgba(55,230,255,0.35)"; ctx.fillRect(0, sy, W, Math.max(1, px(0.5)));
+
+  // contador por categoria
+  if (S.counts) {
+    const now_ = {};
+    tracks.filter(t => t.hits >= 2).forEach(t => now_[t.label] = (now_[t.label] || 0) + 1);
+    const rows = Object.entries(now_).sort((a, b) => b[1] - a[1]).slice(0, 6);
+    const x = m + px(4); let y = H - m - px(14) - rows.length * px(12) - px(16);
+    ctx.fillStyle = "rgba(4,10,14,0.6)";
+    ctx.fillRect(x - px(4), y - px(4), px(118), rows.length * px(12) + px(28));
+    ctx.textBaseline = "top"; ctx.font = font(7.5, 500); ctx.fillStyle = "#7f9aa8";
+    ctx.fillText(`EN CUADRO · VISTOS ${seenIds.size}`, x, y); y += px(13);
+    rows.forEach(([l, n]) => {
+      ctx.fillStyle = colorOf(l); ctx.fillRect(x, y + px(3), px(3), px(3));
+      ctx.font = font(8.5, 500); ctx.fillStyle = "#e6f6ff"; ctx.fillText(l, x + px(7), y);
+      ctx.fillStyle = colorOf(l); ctx.textAlign = "right"; ctx.fillText(String(n).padStart(2, "0"), x + px(108), y);
+      ctx.textAlign = "left"; y += px(12);
+    });
+  }
+  // sello de tiempo
+  const d = new Date();
+  ctx.font = font(7.5, 400); ctx.fillStyle = "rgba(230,246,255,0.8)"; ctx.textAlign = "right"; ctx.textBaseline = "bottom";
+  ctx.fillText(`${d.toLocaleDateString("es-MX")} ${d.toLocaleTimeString("es-MX")} · ${W}x${H}`, W - m - px(4), H - m - px(4));
+  ctx.textAlign = "left";
+  if (rec) {
+    const s = Math.floor((now - recStart) / 1000);
+    ctx.fillStyle = (Math.floor(now / 500) % 2) ? "#ff3b5c" : "rgba(255,59,92,0.4)";
+    ctx.beginPath(); ctx.arc(W - m - px(52), m + px(12), px(3.5), 0, 6.3); ctx.fill();
+    ctx.font = font(9, 500); ctx.fillStyle = "#ff3b5c"; ctx.textBaseline = "middle";
+    ctx.fillText(`REC ${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`, W - m - px(45), m + px(12));
+  }
+}
+
+// ---------------------------------------------------------------- ciclo
+function loop() {
+  if (!running) return;
+  const now = performance.now();
+  if (video.readyState >= 2 && video.videoWidth) {
+    const W = video.videoWidth, H = video.videoHeight;
+    if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+    U = Math.min(W, H) / 360;
+    const mirror = source === "camera" && facing === "user";
+    if (mirror) { ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1); ctx.drawImage(video, 0, 0, W, H); ctx.restore(); }
+    else ctx.drawImage(video, 0, 0, W, H);
+
+    let ts = now; if (ts <= lastTs) ts = lastTs + 1; lastTs = ts;
+    if (detector && !(source === "file" && video.paused)) {
+      const t0 = performance.now();
+      try { updateTracks(detector.detectForVideo(video, ts).detections, now, W); } catch (e) { console.warn(e); }
+      if (S.hands && handLm) { try { handRes = handLm.detectForVideo(video, ts); } catch (e) {} } else handRes = null;
+      detMs = detMs * 0.9 + (performance.now() - t0) * 0.1;
+    }
+    drawTracks(now);
+    if (S.hands) drawHands();
+    drawFrameHUD(now);
+    const dt = now - lastFrameT; lastFrameT = now;
+    fps = fps * 0.9 + (dt > 0 ? 1000 / dt : 0) * 0.1;
+    $("hudChip").textContent = `${S.model === "lite2" ? "PRECISO" : "RÁPIDO"} · ${fps.toFixed(0)} FPS · ${detMs.toFixed(0)} ms`;
+  }
+  if (video.requestVideoFrameCallback && source === "camera") video.requestVideoFrameCallback(loop);
+  else requestAnimationFrame(loop);
+}
+
+// ---------------------------------------------------------------- grabar
+function pickMime() {
+  const types = ["video/mp4;codecs=avc1.42E01E,mp4a.40.2", "video/mp4;codecs=avc1", "video/mp4",
+                 "video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"];
+  return types.find(t => window.MediaRecorder && MediaRecorder.isTypeSupported(t)) || "";
+}
+async function startRecording(fromFile = false) {
+  if (rec) return;
+  if (!window.MediaRecorder || !canvas.captureStream) { status("Este navegador no permite grabar."); return; }
+  const out = canvas.captureStream(30);
+  if (S.audio === "on" && !fromFile) {
+    try { micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          micStream.getAudioTracks().forEach(t => out.addTrack(t)); } catch (e) { micStream = null; }
+  }
+  const mime = pickMime();
+  rec = new MediaRecorder(out, mime ? { mimeType: mime, videoBitsPerSecond: 8e6 } : { videoBitsPerSecond: 8e6 });
+  recChunks = [];
+  rec.ondataavailable = e => { if (e.data && e.data.size) recChunks.push(e.data); };
+  rec.onstop = () => {
+    const type = rec.mimeType || mime || "video/webm";
+    const blob = new Blob(recChunks, { type });
+    const secs = Math.round((performance.now() - recStart) / 1000);
+    rec = null;
+    if (micStream) { micStream.getTracks().forEach(t => t.stop()); micStream = null; }
+    $("recBtn").classList.remove("on"); $("recTime").classList.remove("on");
+    showPreview(blob, type.includes("mp4") ? "mp4" : "webm", `${secs} s · ${(blob.size / 1e6).toFixed(1)} MB`);
+  };
+  rec.start(1000);
+  recStart = performance.now();
+  $("recBtn").classList.add("on"); $("recTime").classList.add("on");
+}
+function stopRecording() { if (rec && rec.state !== "inactive") rec.stop(); }
+setInterval(() => {
+  if (!rec) return;
+  const s = Math.floor((performance.now() - recStart) / 1000);
+  $("recTime").textContent = `● REC ${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+}, 250);
+
+let pvBlob = null, pvName = "";
+function showPreview(blob, ext, info) {
+  pvBlob = blob;
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  pvName = `visor-${stamp}.${ext}`;
+  const url = URL.createObjectURL(blob);
+  const isImg = ext === "jpg";
+  $("pvTitle").textContent = isImg ? "Foto lista" : "Video listo";
+  $("pvMedia").innerHTML = isImg ? `<img src="${url}" alt="Captura con detecciones">`
+                                 : `<video src="${url}" controls playsinline></video>`;
+  $("pvInfo").textContent = info;
+  $("preview").hidden = false;
+}
+$("pvShare").onclick = async () => {
+  if (!pvBlob) return;
+  const file = new File([pvBlob], pvName, { type: pvBlob.type });
+  try {
+    if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: "Visor Scan" }); return; }
+  } catch (e) { if (e.name === "AbortError") return; }
+  $("pvDl").click();
+};
+$("pvDl").onclick = () => {
+  if (!pvBlob) return;
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(pvBlob); a.download = pvName;
+  document.body.appendChild(a); a.click(); a.remove();
+};
+$("pvClose").onclick = () => { $("preview").hidden = true; $("pvMedia").innerHTML = ""; };
+
+// ---------------------------------------------------------------- UI
+$("camBtn").onclick = () => launch("camera");
+$("galBtn").onclick = () => $("fileIn").click();
+$("fileIn").onchange = e => { const f = e.target.files[0]; if (f) launch("file", f); e.target.value = ""; };
+video.addEventListener("ended", () => { if (source === "file") stopRecording(); });
+$("recBtn").onclick = () => rec ? stopRecording() : startRecording();
+$("flipBtn").onclick = async () => { facing = facing === "environment" ? "user" : "environment"; tracks = [];
+  try { await startCamera(); } catch (e) { status("No se pudo cambiar de cámara."); } };
+$("shotBtn").onclick = () => canvas.toBlob(b => b && showPreview(b, "jpg", `${canvas.width}x${canvas.height}`), "image/jpeg", 0.92);
+
+function syncSettings() {
+  document.querySelectorAll(".seg[data-key]").forEach(seg => seg.querySelectorAll(".opt").forEach(b =>
+    b.setAttribute("aria-pressed", String(S[seg.dataset.key] === b.dataset.v))));
+  document.querySelectorAll(".seg[data-multi] .opt").forEach(b => b.setAttribute("aria-pressed", String(!!S[b.dataset.k])));
+  $("conf").value = Math.round(S.conf * 100); $("confV").textContent = Math.round(S.conf * 100) + "%";
+}
+document.querySelectorAll(".seg[data-key] .opt").forEach(b => b.onclick = () => {
+  S[b.parentElement.dataset.key] = b.dataset.v; save(); syncSettings(); });
+document.querySelectorAll(".seg[data-multi] .opt").forEach(b => b.onclick = () => {
+  S[b.dataset.k] = !S[b.dataset.k]; save(); syncSettings(); });
+$("conf").oninput = e => { S.conf = e.target.value / 100; save(); syncSettings(); };
+$("setBtn").onclick = () => { syncSettings(); $("settings").hidden = false; };
+$("closeSet").onclick = async () => { $("settings").hidden = true;
+  try { await ensureDetector(); } catch (e) { status("No se pudo cargar el modelo."); } };
+document.addEventListener("visibilitychange", async () => {
+  if (document.visibilityState === "visible" && running) { try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {} }
+});
+syncSettings();
+
+// modo prueba: ?demo=video.mp4 procesa un video del servidor sin tocar botones
+const demo = new URLSearchParams(location.search).get("demo");
+if (demo) {
+  fetch(demo).then(r => r.blob()).then(b => launch("file", new File([b], "demo.mp4", { type: b.type })));
+}
+
+if ("serviceWorker" in navigator && location.protocol === "https:") {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+}
+window.__visor = { get tracks() { return tracks; }, get fps() { return fps; }, get detMs() { return detMs; }, S };
+</script>
+</body>
+</html>
