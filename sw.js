@@ -1,8 +1,11 @@
 // Visor Scan: guarda la app, el motor de vision y los modelos en el telefono
 // para que funcione sin senal (metro, parque). Primera carga con internet.
-const CACHE = "visor-v1";
+//  - Archivos de la app (html/js/manifest): primero la red, para recibir
+//    actualizaciones; si no hay senal, la copia guardada.
+//  - Modelos, motor wasm y fuentes: primero la copia guardada (no cambian).
+const CACHE = "visor-v2";
 const CORE = [
-  "./", "index.html", "manifest.webmanifest", "icon-192.png", "icon-512.png",
+  "./", "index.html", "detector-worker.js", "manifest.webmanifest", "icon-192.png", "icon-512.png",
   "models/efficientdet_lite0.tflite",
   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs",
 ];
@@ -17,15 +20,22 @@ self.addEventListener("activate", e => {
     .then(() => self.clients.claim()));
 });
 
-// cache primero; lo que no este guardado se baja y se guarda (wasm, modelos, fuentes)
+const put = (req, res) => {
+  if (res && (res.ok || res.type === "opaque")) {
+    const copy = res.clone();
+    caches.open(CACHE).then(c => c.put(req, copy));
+  }
+  return res;
+};
+
 self.addEventListener("fetch", e => {
   const req = e.request;
   if (req.method !== "GET" || req.url.startsWith("blob:")) return;
-  e.respondWith(caches.match(req).then(hit => hit || fetch(req).then(res => {
-    if (res && (res.ok || res.type === "opaque")) {
-      const copy = res.clone();
-      caches.open(CACHE).then(c => c.put(req, copy));
-    }
-    return res;
-  })));
+  const url = new URL(req.url);
+  const appFile = url.origin === location.origin && !url.pathname.includes("/models/");
+  if (appFile) {
+    e.respondWith(fetch(req).then(res => put(req, res)).catch(() => caches.match(req, { ignoreSearch: true })));
+  } else {
+    e.respondWith(caches.match(req).then(hit => hit || fetch(req).then(res => put(req, res))));
+  }
 });

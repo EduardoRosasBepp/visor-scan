@@ -174,10 +174,16 @@
 </section>
 
 <script type="module">
-import { FilesetResolver, ObjectDetector, HandLandmarker }
-  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs";
-
-const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm";
+// ============================================================================
+// Visor Scan. Arquitectura:
+//   - Ciclo de DIBUJO (requestAnimationFrame): video + HUD a la tasa de pantalla.
+//   - Ciclo de IA (Web Worker): recibe una copia reducida del cuadro y detecta
+//     en paralelo. Mientras tanto, los recuadros se interpolan y predicen.
+//   - Si el navegador no soporta el worker, la IA corre en el hilo principal
+//     pero igual separada del dibujo.
+// ============================================================================
+const VER = "1.0.1";
+const CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const MODELS = {
   lite0: ["models/efficientdet_lite0.tflite",
           "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/latest/efficientdet_lite0.tflite"],
@@ -186,6 +192,8 @@ const MODELS = {
   hands: ["models/hand_landmarker.task",
           "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"],
 };
+const absUrls = list => list.map(u => new URL(u, location.href).href);
+const DET_W = { lite0: 480, lite2: 640 };        // ancho de la copia que se manda a la IA
 
 const ES = {person:"PERSONA",bicycle:"BICICLETA",car:"AUTO",motorcycle:"MOTO",airplane:"AVION",bus:"AUTOBUS",
   train:"TREN",truck:"CAMION",boat:"BOTE","traffic light":"SEMAFORO","fire hydrant":"HIDRANTE","stop sign":"ALTO",
@@ -211,48 +219,127 @@ const colorOf = l => GROUP[l] || OTHER;
 const $ = id => document.getElementById(id);
 const canvas = $("view"), ctx = canvas.getContext("2d");
 const video = $("src");
+const small = document.createElement("canvas");            // copia reducida para la IA
+const sctx = small.getContext("2d", { willReadFrequently: false });
 const S = { model: "lite0", trails: true, net: true, counts: true, hands: false, conf: 0.4, audio: "on" };
 try { Object.assign(S, JSON.parse(localStorage.getItem("visor") || "{}")); } catch (e) {}
 const save = () => { try { localStorage.setItem("visor", JSON.stringify(S)); } catch (e) {} };
 
-let fileset = null, detector = null, handLm = null, loadedModel = "";
 let running = false, facing = "environment", stream = null, source = "camera";
-let tracks = [], nextId = 1000, seenIds = new Set(), seenByLabel = {};
-let lastTs = 0, fps = 0, lastFrameT = performance.now(), detMs = 0, handRes = null;
+let tracks = [], nextId = 1000, seenIds = new Set();
+let fps = 0, lastFrameT = performance.now(), aiMs = 0, aiRate = 0, aiLast = 0, delegate = "—";
+let handRes = null;
 let rec = null, recChunks = [], recStart = 0, micStream = null, wakeLock = null;
-
 const status = t => { $("status").textContent = t; };
 
-// ---------------------------------------------------------------- modelos
-async function loadModel(url2, create) {
-  for (const url of url2) {
-    for (const delegate of ["GPU", "CPU"]) {
-      try { return await create(url, delegate); } catch (e) { console.warn("fallo", url, delegate, e); }
-    }
-  }
-  throw new Error("No se pudo cargar el modelo");
-}
-async function ensureDetector() {
-  if (!fileset) { status("Cargando motor de visión…"); fileset = await FilesetResolver.forVisionTasks(WASM); }
-  if (loadedModel !== S.model) {
+// ---------------------------------------------------------------- motor de IA
+// Implementacion A: Web Worker (no bloquea el dibujo)
+// Implementacion B: hilo principal (respaldo)
+const AI = {
+  mode: "", busy: false, ready: false, model: "", hands: false, frameId: 0, worker: null, main: null,
+
+  async init() {
+    const want = { model: S.model, hands: S.hands };
+    if (this.ready && this.model === want.model && (this.hands || !want.hands)) return;
     status("Cargando modelo " + (S.model === "lite2" ? "preciso" : "rápido") + "…");
-    if (detector) detector.close();
-    detector = await loadModel(MODELS[S.model], (url, delegate) => ObjectDetector.createFromOptions(fileset, {
-      baseOptions: { modelAssetPath: url, delegate }, runningMode: "VIDEO",
-      scoreThreshold: 0.2, maxResults: 30 }));
-    loadedModel = S.model; tracks = [];
-  }
-  if (S.hands && !handLm) {
-    status("Cargando manos…");
-    handLm = await loadModel(MODELS.hands, (url, delegate) => HandLandmarker.createFromOptions(fileset, {
-      baseOptions: { modelAssetPath: url, delegate }, runningMode: "VIDEO", numHands: 2 }));
-  }
-  status("");
+    if (this.mode !== "main") {
+      try { await this.initWorker(want); this.mode = "worker"; }
+      catch (e) { console.warn("worker no disponible, uso hilo principal:", e); this.mode = "main"; }
+    }
+    if (this.mode === "main") await this.initMain(want);
+    this.model = want.model; this.hands = this.hands || want.hands; this.ready = true; tracks = [];
+    status("");
+  },
+
+  initWorker(want) {
+    return new Promise((ok, bad) => {
+      if (!this.worker) {
+        this.worker = new Worker("detector-worker.js", { type: "module" });
+        this.worker.onmessage = e => this.onWorker(e.data);
+        this.worker.onerror = e => { e.preventDefault(); this._pending && this._pending.bad(new Error(e.message || "worker")); };
+      }
+      const t = setTimeout(() => bad(new Error("timeout")), 45000);
+      this._pending = { ok: v => { clearTimeout(t); ok(v); }, bad: v => { clearTimeout(t); bad(v); } };
+      this.worker.postMessage({ type: "init", model: want.model, urls: absUrls(MODELS[want.model]),
+                                hands: want.hands, handUrls: absUrls(MODELS.hands) });
+    });
+  },
+
+  onWorker(m) {
+    if (m.type === "ready") { delegate = m.delegate; this._pending && this._pending.ok(); this._pending = null; }
+    else if (m.type === "error") {
+      if (this._pending) { this._pending.bad(new Error(m.message)); this._pending = null; }
+      this.busy = false;
+    } else if (m.type === "result") { this.busy = false; handleResult(m); }
+  },
+
+  async initMain(want) {
+    const V = await import(`${CDN}/vision_bundle.mjs`);
+    if (!this.main) this.main = { fileset: await V.FilesetResolver.forVisionTasks(`${CDN}/wasm`) };
+    const mk = async (Task, urls, opts) => {
+      for (const url of urls) for (const d of ["GPU", "CPU"]) {
+        try { return [await Task.createFromOptions(this.main.fileset, { baseOptions: { modelAssetPath: url, delegate: d }, ...opts }), d]; }
+        catch (e) {}
+      }
+      throw new Error("modelo");
+    };
+    if (this.model !== want.model) {
+      if (this.main.det) this.main.det.close();
+      [this.main.det, delegate] = await mk(V.ObjectDetector, MODELS[want.model], { runningMode: "VIDEO", scoreThreshold: 0.2, maxResults: 30 });
+    }
+    if (want.hands && !this.main.hands) [this.main.hands] = await mk(V.HandLandmarker, MODELS.hands, { runningMode: "VIDEO", numHands: 2 });
+  },
+
+  // manda un cuadro reducido a la IA si no esta ocupada
+  async pump() {
+    if (!this.ready || this.busy || video.readyState < 2 || !video.videoWidth) return;
+    if (source === "file" && video.paused) return;
+    const W = video.videoWidth, H = video.videoHeight, dw = DET_W[S.model] || 480;
+    const sw = Math.min(dw, W), sh = Math.round(H * sw / W);
+    if (small.width !== sw || small.height !== sh) { small.width = sw; small.height = sh; }
+    sctx.drawImage(video, 0, 0, sw, sh);
+    this.busy = true;
+    const id = ++this.frameId, ts = performance.now();
+    if (this.mode === "worker") {
+      try {
+        const bitmap = await createImageBitmap(small);
+        this.worker.postMessage({ type: "frame", id, ts, bitmap, hands: S.hands }, [bitmap]);
+      } catch (e) { this.busy = false; }
+    } else {
+      // respaldo: en el siguiente turno del event loop para no frenar este cuadro
+      setTimeout(() => {
+        const t0 = performance.now(), out = { w: sw, h: sh, dets: [], hands: null };
+        try {
+          out.dets = this.main.det.detectForVideo(small, ts).detections.map(d => ({
+            x: d.boundingBox.originX, y: d.boundingBox.originY, w: d.boundingBox.width, h: d.boundingBox.height,
+            name: d.categories[0].categoryName, score: d.categories[0].score }));
+          if (S.hands && this.main.hands)
+            out.hands = this.main.hands.detectForVideo(small, ts).landmarks.map(l => l.map(p => [p.x, p.y]));
+        } catch (e) { console.warn(e); }
+        out.ms = performance.now() - t0;
+        this.busy = false; handleResult(out);
+      }, 0);
+    }
+  },
+};
+
+function handleResult(m) {
+  const now = performance.now();
+  aiMs = aiMs ? aiMs * 0.8 + m.ms * 0.2 : m.ms;
+  if (aiLast) aiRate = aiRate * 0.8 + (1000 / Math.max(1, now - aiLast)) * 0.2;
+  aiLast = now;
+  const W = video.videoWidth, k = W / m.w;
+  const mirror = source === "camera" && facing === "user";
+  const list = m.dets.filter(d => d.score >= S.conf).map(d => {
+    const x = d.x * k, w = d.w * k;
+    return { box: [mirror ? W - x - w : x, d.y * k, w, d.h * k],
+             label: ES[d.name] || d.name.toUpperCase(), score: d.score };
+  });
+  updateTracks(list, now);
+  handRes = m.hands ? m.hands.map(h => h.map(([x, y]) => [mirror ? 1 - x : x, y])) : null;
 }
 
 // ---------------------------------------------------------------- fuentes
-// play() puede rechazarse si el navegador pausa el video (ahorro de energia);
-// no es fatal: se reanuda al volver a la pagina o al tocar la pantalla.
 async function safePlay() {
   try { await video.play(); }
   catch (e) { if (e.name !== "AbortError" && e.name !== "NotAllowedError") throw e; console.warn("play pospuesto:", e.message); }
@@ -291,16 +378,15 @@ function stopSource() {
 async function launch(kind, file) {
   try {
     $("camBtn").disabled = $("galBtn").disabled = true;
-    await ensureDetector();
+    await AI.init();
     if (kind === "camera") await startCamera(); else await startFile(file);
     $("start").hidden = true; $("top").hidden = false; $("bottom").hidden = false;
     $("flipBtn").hidden = kind !== "camera";
     try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {}
-    if (!running) { running = true; loop(); }
+    if (!running) { running = true; requestAnimationFrame(loop); }
     if (kind === "file") {                          // procesa y graba el video completo
       const go = () => { video.currentTime = 0; startRecording(true); };
-      if (!video.paused) go();
-      else video.addEventListener("playing", go, { once: true });
+      if (!video.paused) go(); else video.addEventListener("playing", go, { once: true });
     }
   } catch (e) {
     console.error(e);
@@ -318,34 +404,39 @@ const iou = (a, b) => {
   const u = a[2] * a[3] + b[2] * b[3] - i;
   return u > 0 ? i / u : 0;
 };
-function updateTracks(dets, now, W) {
-  const mirror = source === "camera" && facing === "user";
-  const list = dets.filter(d => d.categories[0].score >= S.conf).map(d => {
-    const b = d.boundingBox, c = d.categories[0];
-    const x = mirror ? W - b.originX - b.width : b.originX;
-    return { box: [x, b.originY, b.width, b.height], label: ES[c.categoryName] || c.categoryName.toUpperCase(), score: c.score };
-  });
+function updateTracks(list, now) {
   const used = new Set();
   for (const t of tracks) {
-    let best = 0.2, bi = -1;
-    list.forEach((d, i) => { if (!used.has(i) && d.label === t.label) { const v = iou(t.box, d.box); if (v > best) { best = v; bi = i; } } });
+    // compara contra la posicion predicha, no la ultima vista
+    const pred = predicted(t, now);
+    let best = 0.15, bi = -1;
+    list.forEach((d, i) => { if (!used.has(i) && d.label === t.label) { const v = iou(pred, d.box); if (v > best) { best = v; bi = i; } } });
     if (bi >= 0) {
       const d = list[bi]; used.add(bi);
+      const dt = Math.max(30, now - t.seen) / 1000;
+      const nv = [0, 1, 2, 3].map(k => (d.box[k] - t.box[k]) / dt);
+      t.vel = t.vel ? t.vel.map((v, k) => v * 0.5 + nv[k] * 0.5) : nv;
       t.box = d.box; t.score = t.score * 0.6 + d.score * 0.4; t.seen = now; t.hits++;
-      if (t.hits === 3) { seenIds.add(t.id); seenByLabel[t.label] = (seenByLabel[t.label] || 0) + 1; }
+      if (t.hits === 3) seenIds.add(t.id);
     }
   }
   list.forEach((d, i) => {
     if (!used.has(i)) tracks.push({ id: nextId++, label: d.label, box: d.box, draw: d.box.slice(), score: d.score,
-      seen: now, born: now, hits: 1, trail: [] });
+      seen: now, born: now, hits: 1, trail: [], vel: null });
   });
-  tracks = tracks.filter(t => now - t.seen < 700);
+  tracks = tracks.filter(t => now - t.seen < 900);
+}
+// prediccion lineal corta entre detecciones (hasta 200 ms) para que el recuadro no se quede atras
+function predicted(t, now) {
+  if (!t.vel) return t.box;
+  const dt = Math.min(0.2, (now - t.seen) / 1000);
+  return t.box.map((v, k) => v + t.vel[k] * dt * (k < 2 ? 1 : 0.3));
 }
 
 // ---------------------------------------------------------------- dibujo
-let U = 2;                                   // unidad de escala del HUD
+let U = 2;
 const px = n => n * U;
-function font(size, weight = 500, fam = "IBM Plex Mono") { return `${weight} ${px(size)}px "${fam}", ui-monospace, monospace`; }
+function font(size, weight = 500) { return `${weight} ${px(size)}px "IBM Plex Mono", ui-monospace, monospace`; }
 
 function plate(x, y, lines, col) {
   ctx.font = font(9.5, 500);
@@ -353,76 +444,73 @@ function plate(x, y, lines, col) {
   ctx.font = font(7.5, 400);
   const w2 = lines[1] ? ctx.measureText(lines[1]).width : 0;
   const w = Math.max(w1, w2) + px(10), h = lines[1] ? px(24) : px(14);
-  const W = canvas.width;
-  x = Math.min(Math.max(0, x), W - w);
+  x = Math.min(Math.max(0, x), canvas.width - w);
   ctx.fillStyle = "rgba(4,10,14,0.66)"; ctx.fillRect(x, y, w, h);
   ctx.fillStyle = col; ctx.fillRect(x, y, px(1.5), h);
   ctx.textBaseline = "top";
   ctx.font = font(9.5, 500); ctx.fillStyle = col; ctx.fillText(lines[0], x + px(5), y + px(2));
   if (lines[1]) { ctx.font = font(7.5, 400); ctx.fillStyle = "#e6f6ff"; ctx.fillText(lines[1], x + px(5), y + px(14)); }
-  return h;
 }
 
-function drawTracks(now) {
+function drawTracks(now, dtFrame) {
   const W = canvas.width, H = canvas.height, lw = Math.max(1, px(0.6));
   const live = tracks.filter(t => t.hits >= 2);
+  // suavizado independiente de los FPS: alcanza el objetivo en ~80 ms
+  const a = 1 - Math.exp(-dtFrame / 80);
   for (const t of live) {
-    for (let k = 0; k < 4; k++) t.draw[k] += (t.box[k] - t.draw[k]) * 0.5;
+    const target = predicted(t, now);
+    for (let k = 0; k < 4; k++) t.draw[k] += (target[k] - t.draw[k]) * a;
     const [x, y, w, h] = t.draw;
-    const cx = x + w / 2, cy = y + h / 2;
-    t.trail.push([cx, cy]); if (t.trail.length > 24) t.trail.shift();
+    if (!t.lastTrail || now - t.lastTrail > 40) { t.trail.push([x + w / 2, y + h / 2]); t.lastTrail = now; }
+    if (t.trail.length > 24) t.trail.shift();
   }
-  // red de conexiones entre objetos cercanos
   if (S.net && live.length > 1) {
     const diag = Math.hypot(W, H);
     ctx.lineWidth = lw; ctx.strokeStyle = "rgba(55,230,255,0.28)";
     const cs = live.map(t => [t.draw[0] + t.draw[2] / 2, t.draw[1] + t.draw[3] / 2]);
     const done = new Set();
-    cs.forEach((a, i) => {
-      cs.map((b, j) => [j, Math.hypot(a[0] - b[0], a[1] - b[1])]).filter(([j]) => j !== i)
-        .sort((p, q) => p[1] - q[1]).slice(0, 2).forEach(([j, d]) => {
+    ctx.beginPath();
+    cs.forEach((p, i) => {
+      cs.map((b, j) => [j, Math.hypot(p[0] - b[0], p[1] - b[1])]).filter(([j]) => j !== i)
+        .sort((u, v) => u[1] - v[1]).slice(0, 2).forEach(([j, d]) => {
           const key = i < j ? i + "-" + j : j + "-" + i;
           if (done.has(key) || d > diag * 0.35) return; done.add(key);
-          ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(cs[j][0], cs[j][1]); ctx.stroke();
+          ctx.moveTo(p[0], p[1]); ctx.lineTo(cs[j][0], cs[j][1]);
         });
     });
+    ctx.stroke();
   }
   for (const t of live) {
     const [x, y, w, h] = t.draw, col = colorOf(t.label);
     const cx = x + w / 2, cy = y + h / 2;
-    // rastro
     if (S.trails && t.trail.length > 2) {
+      ctx.strokeStyle = col; ctx.lineWidth = lw;
       for (let k = 1; k < t.trail.length; k++) {
-        ctx.strokeStyle = col; ctx.globalAlpha = k / t.trail.length * 0.7; ctx.lineWidth = lw;
+        ctx.globalAlpha = k / t.trail.length * 0.7;
         ctx.beginPath(); ctx.moveTo(...t.trail[k - 1]); ctx.lineTo(...t.trail[k]); ctx.stroke();
       }
       ctx.globalAlpha = 1;
     }
-    // caja fina + esquinas
     ctx.lineWidth = lw; ctx.strokeStyle = col; ctx.globalAlpha = 0.55; ctx.strokeRect(x, y, w, h); ctx.globalAlpha = 1;
     const L = Math.max(px(5), Math.min(w, h) * 0.18);
     ctx.lineWidth = Math.max(1.5, px(1.1)); ctx.strokeStyle = "#ffffff";
     ctx.beginPath();
-    [[x, y, 1, 1], [x + w, y, -1, 1], [x, y + h, 1, -1], [x + w, y + h, -1, -1]].forEach(([a, b, dx, dy]) => {
-      ctx.moveTo(a + dx * L, b); ctx.lineTo(a, b); ctx.lineTo(a, b + dy * L);
+    [[x, y, 1, 1], [x + w, y, -1, 1], [x, y + h, 1, -1], [x + w, y + h, -1, -1]].forEach(([p, q, dx, dy]) => {
+      ctx.moveTo(p + dx * L, q); ctx.lineTo(p, q); ctx.lineTo(p, q + dy * L);
     });
     ctx.stroke();
-    // centro
     ctx.lineWidth = lw; ctx.strokeStyle = col;
     ctx.beginPath(); ctx.moveTo(cx - px(3), cy); ctx.lineTo(cx + px(3), cy); ctx.moveTo(cx, cy - px(3)); ctx.lineTo(cx, cy + px(3)); ctx.stroke();
-    // animacion de enganche al aparecer
     const age = now - t.born;
     if (age < 450) {
       const k = age / 450, g = (1 - k) * px(18);
       ctx.globalAlpha = 1 - k; ctx.strokeStyle = col; ctx.strokeRect(x - g, y - g, w + 2 * g, h + 2 * g); ctx.globalAlpha = 1;
     }
-    // placa
-    const small = w < px(60);
+    const tiny = w < px(60);
     const l1 = `${t.label} ${Math.round(t.score * 100)}%`;
-    const l2 = small ? null : `ID ${t.id} · ${Math.round(cx)},${Math.round(cy)}`;
+    const l2 = tiny ? null : `ID ${t.id} · ${Math.round(cx)},${Math.round(cy)}`;
     const ph = l2 ? px(24) : px(14);
-    const py = y - ph - px(2) > px(4) ? y - ph - px(2) : y + px(2);
-    plate(x, py, [l1, l2], col);
+    plate(x, y - ph - px(2) > px(4) ? y - ph - px(2) : y + px(2), [l1, l2], col);
   }
 }
 
@@ -430,11 +518,11 @@ const HAND_EDGES = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10]
   [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
 const FINGERS = [["THUMB",4],["INDEX",8],["MIDDLE",12],["RING",16],["PINKY",20]];
 function drawHands() {
-  if (!handRes || !handRes.landmarks) return;
-  const W = canvas.width, H = canvas.height, mirror = source === "camera" && facing === "user";
+  if (!handRes) return;
+  const W = canvas.width, H = canvas.height;
   ctx.lineWidth = Math.max(1, px(0.6));
-  handRes.landmarks.forEach((lm, hi) => {
-    const P = lm.map(p => [(mirror ? 1 - p.x : p.x) * W, p.y * H]);
+  handRes.forEach(lm => {
+    const P = lm.map(([x, y]) => [x * W, y * H]);
     ctx.strokeStyle = "#37e6ff"; ctx.beginPath();
     HAND_EDGES.forEach(([a, b]) => { ctx.moveTo(...P[a]); ctx.lineTo(...P[b]); }); ctx.stroke();
     P.forEach(p => { ctx.beginPath(); ctx.arc(p[0], p[1], px(1.6), 0, 6.3); ctx.stroke(); });
@@ -449,7 +537,6 @@ function drawHands() {
 
 function drawFrameHUD(now) {
   const W = canvas.width, H = canvas.height;
-  // esquinas del visor
   const m = px(10), L = px(22);
   ctx.strokeStyle = "rgba(230,246,255,0.7)"; ctx.lineWidth = Math.max(1, px(0.7));
   ctx.beginPath();
@@ -457,18 +544,16 @@ function drawFrameHUD(now) {
     ctx.moveTo(a + dx * L, b); ctx.lineTo(a, b); ctx.lineTo(a, b + dy * L);
   });
   ctx.stroke();
-  // linea de barrido
   const sy = ((now / 2600) % 1) * H;
   const g = ctx.createLinearGradient(0, sy - px(30), 0, sy);
   g.addColorStop(0, "rgba(55,230,255,0)"); g.addColorStop(1, "rgba(55,230,255,0.10)");
   ctx.fillStyle = g; ctx.fillRect(0, sy - px(30), W, px(30));
   ctx.fillStyle = "rgba(55,230,255,0.35)"; ctx.fillRect(0, sy, W, Math.max(1, px(0.5)));
 
-  // contador por categoria
   if (S.counts) {
-    const now_ = {};
-    tracks.filter(t => t.hits >= 2).forEach(t => now_[t.label] = (now_[t.label] || 0) + 1);
-    const rows = Object.entries(now_).sort((a, b) => b[1] - a[1]).slice(0, 6);
+    const cnt = {};
+    tracks.filter(t => t.hits >= 2).forEach(t => cnt[t.label] = (cnt[t.label] || 0) + 1);
+    const rows = Object.entries(cnt).sort((a, b) => b[1] - a[1]).slice(0, 6);
     const x = m + px(4); let y = H - m - px(14) - rows.length * px(12) - px(16);
     ctx.fillStyle = "rgba(4,10,14,0.6)";
     ctx.fillRect(x - px(4), y - px(4), px(118), rows.length * px(12) + px(28));
@@ -481,7 +566,6 @@ function drawFrameHUD(now) {
       ctx.textAlign = "left"; y += px(12);
     });
   }
-  // sello de tiempo
   const d = new Date();
   ctx.font = font(7.5, 400); ctx.fillStyle = "rgba(230,246,255,0.8)"; ctx.textAlign = "right"; ctx.textBaseline = "bottom";
   ctx.fillText(`${d.toLocaleDateString("es-MX")} ${d.toLocaleTimeString("es-MX")} · ${W}x${H}`, W - m - px(4), H - m - px(4));
@@ -495,34 +579,33 @@ function drawFrameHUD(now) {
   }
 }
 
-// ---------------------------------------------------------------- ciclo
-function loop() {
+// ---------------------------------------------------------------- ciclo de dibujo
+let chipT = 0;
+function loop(now) {
   if (!running) return;
-  const now = performance.now();
-  if (video.readyState >= 2 && video.videoWidth) {
-    const W = video.videoWidth, H = video.videoHeight;
-    if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
-    U = Math.min(W, H) / 360;
-    const mirror = source === "camera" && facing === "user";
-    if (mirror) { ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1); ctx.drawImage(video, 0, 0, W, H); ctx.restore(); }
-    else ctx.drawImage(video, 0, 0, W, H);
+  requestAnimationFrame(loop);
+  now = performance.now();
+  if (video.readyState < 2 || !video.videoWidth) return;
+  const W = video.videoWidth, H = video.videoHeight;
+  if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+  U = Math.min(W, H) / 360;
+  const dtFrame = Math.min(100, now - lastFrameT); lastFrameT = now;
+  fps = fps * 0.9 + (dtFrame > 0 ? 1000 / dtFrame : 0) * 0.1;
 
-    let ts = now; if (ts <= lastTs) ts = lastTs + 1; lastTs = ts;
-    if (detector && !(source === "file" && video.paused)) {
-      const t0 = performance.now();
-      try { updateTracks(detector.detectForVideo(video, ts).detections, now, W); } catch (e) { console.warn(e); }
-      if (S.hands && handLm) { try { handRes = handLm.detectForVideo(video, ts); } catch (e) {} } else handRes = null;
-      detMs = detMs * 0.9 + (performance.now() - t0) * 0.1;
-    }
-    drawTracks(now);
-    if (S.hands) drawHands();
-    drawFrameHUD(now);
-    const dt = now - lastFrameT; lastFrameT = now;
-    fps = fps * 0.9 + (dt > 0 ? 1000 / dt : 0) * 0.1;
-    $("hudChip").textContent = `${S.model === "lite2" ? "PRECISO" : "RÁPIDO"} · ${fps.toFixed(0)} FPS · ${detMs.toFixed(0)} ms`;
+  if (source === "camera" && facing === "user") {
+    ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1); ctx.drawImage(video, 0, 0, W, H); ctx.restore();
+  } else ctx.drawImage(video, 0, 0, W, H);
+
+  AI.pump();                              // no espera: la IA responde cuando puede
+  drawTracks(now, dtFrame);
+  if (S.hands) drawHands();
+  drawFrameHUD(now);
+
+  if (now - chipT > 400) {
+    chipT = now;
+    $("hudChip").textContent =
+      `VIDEO ${fps.toFixed(0)} · IA ${aiRate.toFixed(0)}/s · ${aiMs.toFixed(0)} ms · ${delegate}${AI.mode === "main" ? "·1H" : ""}`;
   }
-  if (video.requestVideoFrameCallback && source === "camera") video.requestVideoFrameCallback(loop);
-  else requestAnimationFrame(loop);
 }
 
 // ---------------------------------------------------------------- grabar
@@ -615,7 +698,7 @@ document.querySelectorAll(".seg[data-multi] .opt").forEach(b => b.onclick = () =
 $("conf").oninput = e => { S.conf = e.target.value / 100; save(); syncSettings(); };
 $("setBtn").onclick = () => { syncSettings(); $("settings").hidden = false; };
 $("closeSet").onclick = async () => { $("settings").hidden = true;
-  try { await ensureDetector(); } catch (e) { status("No se pudo cargar el modelo."); } };
+  try { await AI.init(); } catch (e) { status("No se pudo cargar el modelo."); } };
 document.addEventListener("visibilitychange", async () => {
   if (document.visibilityState === "visible" && running) { try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {} }
 });
@@ -623,14 +706,13 @@ syncSettings();
 
 // modo prueba: ?demo=video.mp4 procesa un video del servidor sin tocar botones
 const demo = new URLSearchParams(location.search).get("demo");
-if (demo) {
-  fetch(demo).then(r => r.blob()).then(b => launch("file", new File([b], "demo.mp4", { type: b.type })));
-}
+if (demo) fetch(demo).then(r => r.blob()).then(b => launch("file", new File([b], "demo.mp4", { type: b.type })));
 
 if ("serviceWorker" in navigator && location.protocol === "https:") {
   navigator.serviceWorker.register("sw.js").catch(() => {});
 }
-window.__visor = { get tracks() { return tracks; }, get fps() { return fps; }, get detMs() { return detMs; }, S };
+window.__visor = { get tracks() { return tracks; }, get fps() { return fps; }, get aiMs() { return aiMs; },
+                   get aiRate() { return aiRate; }, get delegate() { return delegate; }, get mode() { return AI.mode; }, S };
 </script>
 </body>
 </html>
