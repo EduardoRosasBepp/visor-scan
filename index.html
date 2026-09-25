@@ -136,6 +136,7 @@
     <input type="file" id="fileIn" accept="video/*">
   </div>
   <p id="status" role="status"></p>
+  <p id="ver" style="font-size:11px;color:var(--muted);margin:0"></p>
 </section>
 
 <section class="sheet" id="settings" hidden>
@@ -171,6 +172,7 @@
       <button class="btn ghost" id="clearPanels">Borrar paneles</button>
       <button class="btn ghost" id="rebench">Volver a medir</button>
     </div>
+    <button class="btn ghost" id="updApp">Actualizar app</button>
     <div class="row"><label for="conf">Confianza mínima <span id="confV"></span></label>
       <input type="range" id="conf" min="20" max="80" step="5"></div>
     <div class="row"><label>Audio al grabar</label>
@@ -207,7 +209,7 @@
 //     pero igual separada del dibujo.
 // ============================================================================
 const VER = "1.0.1";
-const APPV = "8";                                   // sube con cada version: evita workers viejos en cache
+const APPV = "9";                                   // sube con cada version: evita workers viejos en cache
 const CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const MODELS = {
   lite0: ["models/efficientdet_lite0.tflite",
@@ -1220,6 +1222,7 @@ function diagText() {
     const d = c && c.getExtension("WEBGL_debug_renderer_info");
     return c ? (d ? c.getParameter(d.UNMASKED_RENDERER_WEBGL) : "WebGL2 sí") : "sin WebGL2"; } catch (e) { return "?"; } })();
   return [
+    `Versión: ${APPV}`,
     `IA en: ${AI.mode === "worker" ? "hilo aparte (bien)" : AI.mode === "main" ? "hilo principal (compatibilidad)" : "—"}`,
     `Motor: ${delegate}${AI.benchResults ? "  medición " + JSON.stringify(AI.benchResults) : ""}`,
     AI.fallbackReason ? `Motivo del respaldo: ${AI.fallbackReason}` : "",
@@ -1233,6 +1236,21 @@ function diagText() {
   ].filter(Boolean).join(String.fromCharCode(10));
 }
 $("clearPanels").onclick = () => { panels = []; say("Paneles borrados"); };
+// borra la copia guardada de la app (no los modelos) y recarga la version mas reciente
+$("updApp").onclick = async () => {
+  status("Actualizando…");
+  try {
+    for (const k of await caches.keys()) {
+      const c = await caches.open(k);
+      for (const req of await c.keys()) {
+        if (!/\/models\/|\.tflite|\.task|\.wasm/.test(req.url)) await c.delete(req);
+      }
+    }
+    const regs = await navigator.serviceWorker?.getRegistrations?.() || [];
+    await Promise.all(regs.map(r => r.update().catch(() => {})));
+  } catch (e) {}
+  location.replace(location.pathname + "?u=" + Date.now());
+};
 $("rebench").onclick = async () => {
   S.pref = {}; S.engine = "auto"; save(); syncSettings();
   AI.ready = false; AI.model = ""; $("settings").hidden = true;
@@ -1247,6 +1265,8 @@ document.addEventListener("visibilitychange", async () => {
   if (document.visibilityState === "visible" && running) { try { wakeLock = await navigator.wakeLock?.request("screen"); } catch (e) {} }
 });
 syncSettings();
+
+$("ver").textContent = "Versión " + APPV;
 
 // modo prueba: ?demo=video.mp4 procesa un video del servidor sin tocar botones
 const demo = new URLSearchParams(location.search).get("demo");
