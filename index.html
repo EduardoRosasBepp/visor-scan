@@ -43,6 +43,9 @@
   .bar > * { pointer-events: auto; }
   #top { top: 0; padding-top: calc(env(safe-area-inset-top, 0px) + 10px); }
   #bottom { bottom: 0; padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 18px); justify-content: space-around; }
+  #hudChip { font-size: 11px; line-height: 1.35; min-width: 0; overflow: hidden; }
+  #hudChip b { color: var(--cyan); font-weight: 500; }
+  #hudChip small { display: block; font-size: 9.5px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .chip { font: 500 12px/1 var(--mono); letter-spacing: .06em; color: var(--text);
     background: var(--panel); border: 1px solid var(--line); padding: 8px 10px; border-radius: 3px;
     backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
@@ -157,7 +160,10 @@
         <button class="opt" data-k="hands">Manos y gestos</button>
       </div></div>
     <p>Gestos: pellizca con las dos manos y sepáralas para crear un panel · pellizca un panel para moverlo · dos manos sobre un panel lo giran y escalan · mano abierta 1 s sobre un panel cambia el filtro · sácalo de la pantalla para borrarlo.</p>
-    <button class="btn ghost" id="clearPanels">Borrar paneles</button>
+    <div class="btns">
+      <button class="btn ghost" id="clearPanels">Borrar paneles</button>
+      <button class="btn ghost" id="rebench">Volver a medir</button>
+    </div>
     <div class="row"><label for="conf">Confianza mínima <span id="confV"></span></label>
       <input type="range" id="conf" min="20" max="80" step="5"></div>
     <div class="row"><label>Audio al grabar</label>
@@ -194,7 +200,7 @@
 //     pero igual separada del dibujo.
 // ============================================================================
 const VER = "1.0.1";
-const APPV = "5";                                   // sube con cada version: evita workers viejos en cache
+const APPV = "6";                                   // sube con cada version: evita workers viejos en cache
 const CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const MODELS = {
   lite0: ["models/efficientdet_lite0.tflite",
@@ -355,10 +361,9 @@ const AI = {
     if (this.mode === "main" && performance.now() - (this.lastMain || 0) < Math.max(120, aiMs * 1.5)) return;
     if (S.hands && this.mode === "worker" && performance.now() - (this.lastSend || 0) < 250) return;   // prioridad a las manos
     this.lastSend = performance.now();
-    const W = video.videoWidth, H = video.videoHeight, dw = DET_W[S.model] || 384;
-    const sw = Math.min(dw, W), sh = Math.round(H * sw / W);
-    if (small.width !== sw || small.height !== sh) { small.width = sw; small.height = sh; }
-    sctx.drawImage(video, 0, 0, sw, sh);
+    if (!crop.w) return;
+    grab(small, sctx, DET_W[S.model] || 384);
+    const sw = small.width, sh = small.height;
     this.busy = true;
     const id = ++this.frameId, ts = performance.now();
     if (this.mode === "worker") {
@@ -389,7 +394,7 @@ function handleResult(m) {
   aiMs = aiMs ? aiMs * 0.8 + m.ms * 0.2 : m.ms;
   if (aiLast) aiRate = aiRate * 0.8 + (1000 / Math.max(1, now - aiLast)) * 0.2;
   aiLast = now;
-  const W = video.videoWidth, k = W / m.w;
+  const W = canvas.width, k = W / m.w;
   const mirror = source === "camera" && facing === "user";
   const list = m.dets.filter(d => d.score >= S.conf).map(d => {
     const x = d.x * k, w = d.w * k;
@@ -404,7 +409,7 @@ function handleResult(m) {
 // ---------------------------------------------------------------- manos (hilo propio)
 // Las manos van en su propio worker para que el esqueleto y los gestos
 // respondan en ~50 ms aunque la deteccion de objetos sea lenta.
-const HAND_W = 320;
+const HAND_W = 384;                                  // lado largo de la copia para manos
 const hsmall = document.createElement("canvas");
 const hctx = hsmall.getContext("2d");
 const HANDS = {
@@ -426,7 +431,7 @@ const HANDS = {
         };
         w.onerror = e => { e.preventDefault(); clearTimeout(t); w.terminate(); bad(new Error(e.message || "worker")); };
         w.postMessage({ type: "init", task: "hands", urls: absUrls(MODELS.hands),
-                        prefer: (S.engine !== "auto" ? S.engine : (S.pref && S.pref.lite0)) || "GPU" });
+                        prefer: S.engine !== "auto" ? S.engine : "CPU" });   // CPU: no compite con los objetos en la GPU
       });
       this.ready = true;
     } catch (e) {
@@ -442,9 +447,8 @@ const HANDS = {
   async pump() {
     if (!this.ready || this.busy || video.readyState < 2 || !video.videoWidth) return;
     if (source === "file" && video.paused) return;
-    const W = video.videoWidth, H = video.videoHeight, sw = Math.min(HAND_W, W), sh = Math.round(H * sw / W);
-    if (hsmall.width !== sw || hsmall.height !== sh) { hsmall.width = sw; hsmall.height = sh; }
-    hctx.drawImage(video, 0, 0, sw, sh);
+    if (!crop.w) return;
+    grab(hsmall, hctx, HAND_W);
     this.busy = true;
     try {
       const bitmap = await createImageBitmap(hsmall);
@@ -573,9 +577,27 @@ function updateGestures(now) {
 }
 
 // dibuja el video tal como se ve en pantalla (con espejo si aplica)
+// Solo se trabaja con la parte del video que se ve en pantalla (recorte "cover").
+// Asi nada se dibuja fuera de la vista y la IA no analiza zonas invisibles.
+let crop = { x: 0, y: 0, w: 0, h: 0 };
+function computeCrop() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (source === "file" || !innerWidth || !innerHeight) { crop = { x: 0, y: 0, w: vw, h: vh }; return; }
+  const a = innerWidth / innerHeight, va = vw / vh;
+  if (va > a) { const w = Math.round(vh * a); crop = { x: Math.round((vw - w) / 2), y: 0, w, h: vh }; }
+  else { const h = Math.round(vw / a); crop = { x: 0, y: Math.round((vh - h) / 2), w: vw, h }; }
+}
 function drawBase(c, W, H) {
-  if (source === "camera" && facing === "user") { c.save(); c.translate(W, 0); c.scale(-1, 1); c.drawImage(video, 0, 0, W, H); c.restore(); }
-  else c.drawImage(video, 0, 0, W, H);
+  const { x, y, w, h } = crop;
+  if (source === "camera" && facing === "user") { c.save(); c.translate(W, 0); c.scale(-1, 1); c.drawImage(video, x, y, w, h, 0, 0, W, H); c.restore(); }
+  else c.drawImage(video, x, y, w, h, 0, 0, W, H);
+}
+// copia reducida del recorte, con el lado largo = maxSide
+function grab(cv, cx2, maxSide) {
+  const k = Math.min(1, maxSide / Math.max(crop.w, crop.h));
+  const sw = Math.max(1, Math.round(crop.w * k)), sh = Math.max(1, Math.round(crop.h * k));
+  if (cv.width !== sw || cv.height !== sh) { cv.width = sw; cv.height = sh; }
+  cx2.drawImage(video, crop.x, crop.y, crop.w, crop.h, 0, 0, sw, sh);
 }
 const pix = document.createElement("canvas"), pctx = pix.getContext("2d");
 
@@ -666,7 +688,7 @@ function drawGestureHUD(now) {
             : (!panels.length && handRes && handRes.hands.length ? "Pellizca con las dos manos y sepáralas para crear un panel" : "");
   if (msg) {
     ctx.font = font(9, 500); const w = ctx.measureText(msg).width + px(12);
-    const x = (canvas.width - w) / 2, y = canvas.height - px(58);
+    const x = Math.max(0, (canvas.width - w) / 2), y = canvas.height - RES.bottom - px(22);
     ctx.fillStyle = "rgba(4,10,14,0.7)"; ctx.fillRect(x, y, w, px(16));
     ctx.fillStyle = "#e6f6ff"; ctx.textBaseline = "middle"; ctx.fillText(msg, x + px(6), y + px(8));
   }
@@ -686,7 +708,8 @@ async function startCamera() {
   stopSource();
   source = "camera";
   stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+    video: { facingMode: { ideal: facing }, frameRate: { ideal: 30 },
+             width: { ideal: innerHeight > innerWidth ? 720 : 1280 }, height: { ideal: innerHeight > innerWidth ? 1280 : 720 } },
     audio: false });
   video.srcObject = stream; video.muted = true;
   await safePlay();
@@ -844,7 +867,8 @@ function drawTracks(now, dtFrame) {
     const l1 = `${t.label} ${Math.round(t.score * 100)}%`;
     const l2 = tiny ? null : `ID ${t.id} · ${Math.round(cx)},${Math.round(cy)}`;
     const ph = l2 ? px(24) : px(14);
-    plate(x, y - ph - px(2) > px(4) ? y - ph - px(2) : y + px(2), [l1, l2], col);
+    const top = RES.top + px(2);
+    plate(x, y - ph - px(2) > top ? y - ph - px(2) : Math.max(top, y + px(2)), [l1, l2], col);
   }
 }
 
@@ -870,10 +894,10 @@ function drawHands() {
 
 function drawFrameHUD(now) {
   const W = canvas.width, H = canvas.height;
-  const m = px(10), L = px(22);
+  const m = px(10), L = px(22), T = RES.top + px(6), B = H - RES.bottom - px(6);
   ctx.strokeStyle = "rgba(230,246,255,0.7)"; ctx.lineWidth = Math.max(1, px(0.7));
   ctx.beginPath();
-  [[m, m, 1, 1], [W - m, m, -1, 1], [m, H - m, 1, -1], [W - m, H - m, -1, -1]].forEach(([a, b, dx, dy]) => {
+  [[m, T, 1, 1], [W - m, T, -1, 1], [m, B, 1, -1], [W - m, B, -1, -1]].forEach(([a, b, dx, dy]) => {
     ctx.moveTo(a + dx * L, b); ctx.lineTo(a, b); ctx.lineTo(a, b + dy * L);
   });
   ctx.stroke();
@@ -887,7 +911,7 @@ function drawFrameHUD(now) {
     const cnt = {};
     tracks.filter(t => t.hits >= 2).forEach(t => cnt[t.label] = (cnt[t.label] || 0) + 1);
     const rows = Object.entries(cnt).sort((a, b) => b[1] - a[1]).slice(0, 6);
-    const x = m + px(4); let y = H - m - px(14) - rows.length * px(12) - px(16);
+    const x = m + px(4); let y = B - px(8) - rows.length * px(12) - px(16);
     ctx.fillStyle = "rgba(4,10,14,0.6)";
     ctx.fillRect(x - px(4), y - px(4), px(118), rows.length * px(12) + px(28));
     ctx.textBaseline = "top"; ctx.font = font(7.5, 500); ctx.fillStyle = "#7f9aa8";
@@ -901,33 +925,42 @@ function drawFrameHUD(now) {
   }
   const d = new Date();
   ctx.font = font(7.5, 400); ctx.fillStyle = "rgba(230,246,255,0.8)"; ctx.textAlign = "right"; ctx.textBaseline = "bottom";
-  ctx.fillText(`${d.toLocaleDateString("es-MX")} ${d.toLocaleTimeString("es-MX")} · ${W}x${H}`, W - m - px(4), H - m - px(4));
+  ctx.fillText(`${d.toLocaleDateString("es-MX")} ${d.toLocaleTimeString("es-MX")}`, W - m - px(4), B - px(4));
   ctx.textAlign = "left";
   if (rec) {
     const s = Math.floor((now - recStart) / 1000);
     ctx.fillStyle = (Math.floor(now / 500) % 2) ? "#ff3b5c" : "rgba(255,59,92,0.4)";
-    ctx.beginPath(); ctx.arc(W - m - px(52), m + px(12), px(3.5), 0, 6.3); ctx.fill();
+    ctx.beginPath(); ctx.arc(W - m - px(52), T + px(12), px(3.5), 0, 6.3); ctx.fill();
     ctx.font = font(9, 500); ctx.fillStyle = "#ff3b5c"; ctx.textBaseline = "middle";
-    ctx.fillText(`REC ${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`, W - m - px(45), m + px(12));
+    ctx.fillText(`REC ${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`, W - m - px(45), T + px(12));
   }
 }
 
 // ---------------------------------------------------------------- ciclo de dibujo
-let chipT = 0;
+let chipT = 0, resT = 0;
+// zonas que tapan los controles (arriba y abajo), en pixeles del lienzo
+const RES = { top: 0, bottom: 0, k: 0 };
+function updateReserve() {
+  if (source === "file" || !canvas.clientHeight) { RES.top = RES.bottom = RES.k = 0; return; }
+  const k = RES.k = canvas.height / canvas.clientHeight;
+  RES.top = $("top").hidden ? 0 : $("top").getBoundingClientRect().bottom * k;
+  RES.bottom = $("bottom").hidden ? 0 : (canvas.clientHeight - $("bottom").getBoundingClientRect().top) * k;
+}
 function loop(now) {
   if (!running) return;
   requestAnimationFrame(loop);
   now = performance.now();
   if (video.readyState < 2 || !video.videoWidth) return;
-  const W = video.videoWidth, H = video.videoHeight;
+  computeCrop();
+  const W = crop.w, H = crop.h;
   if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
-  U = Math.min(W, H) / 360;
+  if (now - resT > 500) { resT = now; updateReserve(); }
+  // texto del mismo tamano fisico en cualquier celular: 1 unidad ~ 1.1 px de pantalla
+  U = source === "camera" && RES.k ? RES.k * 1.1 : Math.min(W, H) / 360;
   const dtFrame = Math.min(100, now - lastFrameT); lastFrameT = now;
   fps = fps * 0.9 + (dtFrame > 0 ? 1000 / dtFrame : 0) * 0.1;
 
-  if (source === "camera" && facing === "user") {
-    ctx.save(); ctx.translate(W, 0); ctx.scale(-1, 1); ctx.drawImage(video, 0, 0, W, H); ctx.restore();
-  } else ctx.drawImage(video, 0, 0, W, H);
+  drawBase(ctx, W, H);
 
   AI.pump();                              // no espera: la IA responde cuando puede
   if (S.hands) { HANDS.pump(); updateGestures(now); }
@@ -938,8 +971,9 @@ function loop(now) {
 
   if (now - chipT > 400) {
     chipT = now;
-    $("hudChip").textContent =
-      `VIDEO ${fps.toFixed(0)} · IA ${aiRate.toFixed(0)}/s · ${aiMs.toFixed(0)} ms · ${AI.benchmarking ? "MIDIENDO " : ""}${delegate}${AI.mode === "main" ? " · COMPAT" : ""}${S.hands ? ` · MANOS ${HANDS.rate.toFixed(0)}/s` : ""}`;
+    $("hudChip").innerHTML =
+      `<b>${fps.toFixed(0)}</b> FPS · IA <b>${aiRate.toFixed(0)}</b>/s${S.hands ? ` · MANOS <b>${HANDS.rate.toFixed(0)}</b>/s` : ""}` +
+      `<small>${AI.benchmarking ? "midiendo " : ""}${delegate} ${aiMs.toFixed(0)} ms${S.hands ? ` · manos ${HANDS.delegate} ${HANDS.ms.toFixed(0)} ms` : ""}${AI.mode === "main" ? " · COMPAT" : ""}</small>`;
   }
 }
 
@@ -1050,6 +1084,11 @@ function diagText() {
   ].filter(Boolean).join(String.fromCharCode(10));
 }
 $("clearPanels").onclick = () => { panels = []; say("Paneles borrados"); };
+$("rebench").onclick = async () => {
+  S.pref = {}; S.engine = "auto"; save(); syncSettings();
+  AI.ready = false; AI.model = ""; $("settings").hidden = true;
+  try { await AI.init(); status(""); } catch (e) { status("No se pudo reiniciar la IA."); }
+};
 $("setBtn").onclick = () => { syncSettings(); $("diag").textContent = diagText(); $("settings").hidden = false; };
 $("closeSet").onclick = async () => { $("settings").hidden = true;
   try { await AI.init(); } catch (e) { status("No se pudo cargar el modelo."); }
