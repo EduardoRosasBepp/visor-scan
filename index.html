@@ -142,6 +142,13 @@
         <button class="opt" data-v="lite0">Rápido</button>
         <button class="opt" data-v="lite2">Preciso</button>
       </div></div>
+    <div class="row"><label>Motor de IA</label>
+      <div class="seg" data-key="engine">
+        <button class="opt" data-v="auto">Auto</button>
+        <button class="opt" data-v="GPU">GPU</button>
+        <button class="opt" data-v="CPU">Procesador</button>
+      </div>
+      <p>Auto mide cuál es más rápido en tu celular la primera vez y lo recuerda.</p></div>
     <div class="row"><label>Capas</label>
       <div class="seg" data-multi>
         <button class="opt" data-k="trails">Rastro</button>
@@ -193,7 +200,7 @@ const MODELS = {
           "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"],
 };
 const absUrls = list => list.map(u => new URL(u, location.href).href);
-const DET_W = { lite0: 480, lite2: 640 };        // ancho de la copia que se manda a la IA
+const DET_W = { lite0: 384, lite2: 512 };        // ancho de la copia que se manda a la IA (el modelo rapido trabaja a 320)
 
 const ES = {person:"PERSONA",bicycle:"BICICLETA",car:"AUTO",motorcycle:"MOTO",airplane:"AVION",bus:"AUTOBUS",
   train:"TREN",truck:"CAMION",boat:"BOTE","traffic light":"SEMAFORO","fire hydrant":"HIDRANTE","stop sign":"ALTO",
@@ -221,7 +228,7 @@ const canvas = $("view"), ctx = canvas.getContext("2d");
 const video = $("src");
 const small = document.createElement("canvas");            // copia reducida para la IA
 const sctx = small.getContext("2d", { willReadFrequently: false });
-const S = { model: "lite0", trails: true, net: true, counts: true, hands: false, conf: 0.4, audio: "on" };
+const S = { model: "lite0", engine: "auto", trails: true, net: true, counts: true, hands: false, conf: 0.4, audio: "on", pref: {} };
 try { Object.assign(S, JSON.parse(localStorage.getItem("visor") || "{}")); } catch (e) {}
 const save = () => { try { localStorage.setItem("visor", JSON.stringify(S)); } catch (e) {} };
 
@@ -236,41 +243,77 @@ const status = t => { $("status").textContent = t; };
 // Implementacion A: Web Worker (no bloquea el dibujo)
 // Implementacion B: hilo principal (respaldo)
 const AI = {
-  mode: "", busy: false, ready: false, model: "", hands: false, frameId: 0, worker: null, main: null,
+  mode: "", busy: false, ready: false, model: "", hands: false, engine: "", frameId: 0,
+  worker: null, main: null, bench: null, benchResults: null, benchmarking: false,
 
   async init() {
-    const want = { model: S.model, hands: S.hands };
-    if (this.ready && this.model === want.model && (this.hands || !want.hands)) return;
+    const want = { model: S.model, hands: S.hands, engine: S.engine };
+    if (this.ready && this.model === want.model && this.engine === want.engine && (this.hands || !want.hands)) return;
     status("Cargando modelo " + (S.model === "lite2" ? "preciso" : "rápido") + "…");
+    const saved = S.pref && S.pref[want.model];
+    const prefer = want.engine !== "auto" ? want.engine : (saved || "GPU");
+    // sin preferencia guardada y en Auto: medir ambos motores con los primeros cuadros
+    this.bench = (want.engine === "auto" && !saved) ? { results: {}, times: [] } : null;
+    this.benchmarking = !!this.bench;
+    this.ready = false;
     if (this.mode !== "main") {
-      try { await this.initWorker(want); this.mode = "worker"; }
-      catch (e) { console.warn("worker no disponible, uso hilo principal:", e); this.mode = "main"; }
+      try { await this.startWorker(want, prefer); this.mode = "worker"; }
+      catch (e) { console.warn("worker no disponible, uso hilo principal:", e); this.mode = "main"; this.bench = null; this.benchmarking = false; }
     }
     if (this.mode === "main") await this.initMain(want);
-    this.model = want.model; this.hands = this.hands || want.hands; this.ready = true; tracks = [];
+    this.model = want.model; this.engine = want.engine; this.hands = want.hands; this.ready = true; tracks = [];
     status("");
   },
 
-  initWorker(want) {
+  // cada worker usa un solo motor: para cambiar se crea uno nuevo
+  startWorker(want, prefer) {
+    if (this.worker) { this.worker.terminate(); this.worker = null; }
+    this.busy = false;
     return new Promise((ok, bad) => {
-      if (!this.worker) {
-        this.worker = new Worker("detector-worker.js", { type: "module" });
-        this.worker.onmessage = e => this.onWorker(e.data);
-        this.worker.onerror = e => { e.preventDefault(); this._pending && this._pending.bad(new Error(e.message || "worker")); };
-      }
+      const w = new Worker("detector-worker.js", { type: "module" });
       const t = setTimeout(() => bad(new Error("timeout")), 45000);
-      this._pending = { ok: v => { clearTimeout(t); ok(v); }, bad: v => { clearTimeout(t); bad(v); } };
-      this.worker.postMessage({ type: "init", model: want.model, urls: absUrls(MODELS[want.model]),
-                                hands: want.hands, handUrls: absUrls(MODELS.hands) });
+      w.onmessage = e => {
+        const m = e.data;
+        if (m.type === "ready") { clearTimeout(t); delegate = m.delegate; this.worker = w; ok(); }
+        else if (m.type === "error" && !this.worker) { clearTimeout(t); w.terminate(); bad(new Error(m.message)); }
+        else this.onWorker(m);
+      };
+      w.onerror = e => { e.preventDefault(); clearTimeout(t); w.terminate(); bad(new Error(e.message || "worker")); };
+      w.postMessage({ type: "init", urls: absUrls(MODELS[want.model]), prefer,
+                      hands: want.hands, handUrls: absUrls(MODELS.hands) });
     });
   },
 
   onWorker(m) {
-    if (m.type === "ready") { delegate = m.delegate; this._pending && this._pending.ok(); this._pending = null; }
-    else if (m.type === "error") {
-      if (this._pending) { this._pending.bad(new Error(m.message)); this._pending = null; }
-      this.busy = false;
-    } else if (m.type === "result") { this.busy = false; handleResult(m); }
+    if (m.type === "error") { this.busy = false; console.warn("IA:", m.message); return; }
+    if (m.type !== "result") return;
+    delegate = m.delegate; this.busy = false; handleResult(m);
+    if (this.bench) this.benchStep(m.detMs, m.delegate);
+  },
+
+  async benchStep(ms, d) {
+    const b = this.bench;
+    b.times.push(ms);
+    if (b.times.length < 12) return;
+    const s = b.times.slice(3).sort((x, y) => x - y);
+    b.results[d] = Math.round(s[Math.floor(s.length / 2)]);            // mediana sin calentamiento
+    b.times = [];
+    const want = { model: this.model || S.model, hands: S.hands };
+    const other = d === "GPU" ? "CPU" : "GPU";
+    this.ready = false;
+    try {
+      if (b.results[other] === undefined) {
+        await this.startWorker(want, other);
+        if (delegate === d) b.results[other] = Infinity;               // la otra opcion no existe aqui
+        else { this.ready = true; return; }
+      }
+      const best = (b.results.GPU ?? Infinity) <= (b.results.CPU ?? Infinity) ? "GPU" : "CPU";
+      if (best !== delegate) await this.startWorker(want, best);
+      S.pref = S.pref || {}; S.pref[want.model] = delegate; save();
+      this.benchResults = { ...b.results, elegido: delegate };
+      console.log("autoajuste", this.benchResults);
+    } catch (e) { console.warn("autoajuste fallo", e); }
+    this.bench = null; this.benchmarking = false; this.ready = true;
   },
 
   async initMain(want) {
@@ -283,8 +326,7 @@ const AI = {
       }
       throw new Error("modelo");
     };
-    if (this.model !== want.model) {
-      if (this.main.det) this.main.det.close();
+    if (this.model !== want.model || !this.main.det) {
       [this.main.det, delegate] = await mk(V.ObjectDetector, MODELS[want.model], { runningMode: "VIDEO", scoreThreshold: 0.2, maxResults: 30 });
     }
     if (want.hands && !this.main.hands) [this.main.hands] = await mk(V.HandLandmarker, MODELS.hands, { runningMode: "VIDEO", numHands: 2 });
@@ -294,7 +336,7 @@ const AI = {
   async pump() {
     if (!this.ready || this.busy || video.readyState < 2 || !video.videoWidth) return;
     if (source === "file" && video.paused) return;
-    const W = video.videoWidth, H = video.videoHeight, dw = DET_W[S.model] || 480;
+    const W = video.videoWidth, H = video.videoHeight, dw = DET_W[S.model] || 384;
     const sw = Math.min(dw, W), sh = Math.round(H * sw / W);
     if (small.width !== sw || small.height !== sh) { small.width = sw; small.height = sh; }
     sctx.drawImage(video, 0, 0, sw, sh);
@@ -306,7 +348,6 @@ const AI = {
         this.worker.postMessage({ type: "frame", id, ts, bitmap, hands: S.hands }, [bitmap]);
       } catch (e) { this.busy = false; }
     } else {
-      // respaldo: en el siguiente turno del event loop para no frenar este cuadro
       setTimeout(() => {
         const t0 = performance.now(), out = { w: sw, h: sh, dets: [], hands: null };
         try {
@@ -604,7 +645,7 @@ function loop(now) {
   if (now - chipT > 400) {
     chipT = now;
     $("hudChip").textContent =
-      `VIDEO ${fps.toFixed(0)} · IA ${aiRate.toFixed(0)}/s · ${aiMs.toFixed(0)} ms · ${delegate}${AI.mode === "main" ? "·1H" : ""}`;
+      `VIDEO ${fps.toFixed(0)} · IA ${aiRate.toFixed(0)}/s · ${aiMs.toFixed(0)} ms · ${AI.benchmarking ? "MIDIENDO " : ""}${delegate}${AI.mode === "main" ? "·1H" : ""}`;
   }
 }
 
@@ -712,7 +753,8 @@ if ("serviceWorker" in navigator && location.protocol === "https:") {
   navigator.serviceWorker.register("sw.js").catch(() => {});
 }
 window.__visor = { get tracks() { return tracks; }, get fps() { return fps; }, get aiMs() { return aiMs; },
-                   get aiRate() { return aiRate; }, get delegate() { return delegate; }, get mode() { return AI.mode; }, S };
+                   get aiRate() { return aiRate; }, get delegate() { return delegate; }, get mode() { return AI.mode; },
+                   get bench() { return AI.benchResults; }, get ai() { return AI; }, S };
 </script>
 </body>
 </html>
