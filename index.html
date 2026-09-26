@@ -161,6 +161,14 @@
         <button class="opt" data-k="counts">Contador</button>
         <button class="opt" data-k="hands">Manos y gestos</button>
       </div></div>
+    <div class="row"><label>Lengua de señas</label>
+      <div class="seg" data-multi>
+        <button class="opt" data-k="signs">Subtítulos de señas</button>
+      </div>
+      <button class="btn ghost" id="openTeach">Enseñar señas</button>
+      <label for="signSens">Sensibilidad <span id="signSensV"></span></label>
+      <input type="range" id="signSens" min="50" max="200" step="10">
+      <p>Aprende de los ejemplos que grabes. Graba 3 a 5 por palabra; si otras personas la van a usar, graba también ejemplos de ellas.</p></div>
     <div class="row"><label>Gestos con dos manos</label>
       <div class="seg" data-key="gmode">
         <button class="opt" data-v="panels">Crear paneles</button>
@@ -183,6 +191,25 @@
     <div class="row"><label>Diagnóstico</label>
       <p id="diag" style="font-size:12px;white-space:pre-wrap;word-break:break-word"></p></div>
     <button class="btn ghost" id="closeSet">Listo</button>
+  </div>
+</section>
+
+<section class="sheet" id="teach" hidden>
+  <div class="card">
+    <h2>Enseñar señas</h2>
+    <p>Escribe la palabra, toca Grabar y haz la seña frente a la cámara cuando termine la cuenta 3, 2, 1. Se graba 1.5 segundos, así que puedes incluir movimiento (círculos, ir y venir, tocar la barbilla).</p>
+    <div class="seg" id="presets"></div>
+    <input id="signWord" type="text" placeholder="Palabra o frase" autocomplete="off"
+      style="padding:12px;border:1px solid var(--line);background:transparent;color:var(--text);font:500 15px var(--mono);border-radius:3px">
+    <button class="btn" id="recSign">Grabar ejemplo</button>
+    <p id="teachStatus" style="color:var(--amber)"></p>
+    <div id="signList"></div>
+    <div class="btns">
+      <button class="btn ghost" id="expSigns">Exportar</button>
+      <button class="btn ghost" id="impSigns">Importar</button>
+    </div>
+    <input type="file" id="impFile" accept="application/json,.json" hidden>
+    <button class="btn ghost" id="closeTeach">Listo</button>
   </div>
 </section>
 
@@ -209,13 +236,15 @@
 //     pero igual separada del dibujo.
 // ============================================================================
 const VER = "1.0.1";
-const APPV = "10";                                   // sube con cada version: evita workers viejos en cache
+const APPV = "15";                                   // sube con cada version: evita workers viejos en cache
 const CDN = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${VER}`;
 const MODELS = {
   lite0: ["models/efficientdet_lite0.tflite",
           "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float16/latest/efficientdet_lite0.tflite"],
   lite2: ["models/efficientdet_lite2.tflite",
           "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float16/latest/efficientdet_lite2.tflite"],
+  face: ["models/blaze_face_short_range.tflite",
+         "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite"],
   hands: ["models/hand_landmarker.task",
           "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"],
 };
@@ -248,7 +277,7 @@ const canvas = $("view"), ctx = canvas.getContext("2d");
 const video = $("src");
 const small = document.createElement("canvas");            // copia reducida para la IA
 const sctx = small.getContext("2d", { willReadFrequently: false });
-const S = { model: "lite0", engine: "auto", trails: true, net: true, counts: true, hands: false, conf: 0.4, audio: "on", pref: {}, gmode: "panels" };
+const S = { model: "lite0", engine: "auto", trails: true, net: true, counts: true, hands: false, conf: 0.4, audio: "on", pref: {}, gmode: "panels", signs: false, signSens: 1 };
 try { Object.assign(S, JSON.parse(localStorage.getItem("visor") || "{}")); } catch (e) {}
 const save = () => { try { localStorage.setItem("visor", JSON.stringify(S)); } catch (e) {} };
 
@@ -416,7 +445,10 @@ function handleResult(m) {
 // ---------------------------------------------------------------- manos (hilo propio)
 // Las manos van en su propio worker para que el esqueleto y los gestos
 // respondan en ~50 ms aunque la deteccion de objetos sea lenta.
-const HAND_W = 384;                                  // lado largo de la copia para manos
+const HAND_W = 384;
+const FACE_W = 256;
+const fsmall = document.createElement("canvas"); fsmall.width = fsmall.height = FACE_W;
+const fctx = fsmall.getContext("2d");                                  // lado largo de la copia para manos
 const hsmall = document.createElement("canvas");
 const hctx = hsmall.getContext("2d");
 const HANDS = {
@@ -440,7 +472,8 @@ const HANDS = {
         };
         w.onerror = e => { e.preventDefault(); clearTimeout(t); w.terminate(); bad(new Error(e.message || "worker")); };
         w.postMessage({ type: "init", task: "hands", urls: absUrls(MODELS.hands),
-                        prefer: want });
+                        prefer: want, face: !!S.signs, faceUrls: absUrls(MODELS.face) });
+        this.face = !!S.signs;
       });
       this.ready = true;
     } catch (e) {
@@ -461,7 +494,26 @@ const HANDS = {
     this.busy = true;
     try {
       const bitmap = await createImageBitmap(hsmall);
-      this.worker.postMessage({ type: "frame", id: ++this.frameId, ts: performance.now(), bitmap }, [bitmap]);
+      const msg = { type: "frame", id: ++this.frameId, ts: performance.now(), bitmap }, tr = [bitmap];
+      if (this.face) {
+        // recorte cuadrado para la cara: si ya se vio, centrado en ella (~4 caras de ancho);
+        // si no, se recorre la imagen por zonas (arriba, en medio, abajo) hasta encontrarla
+        const full = Math.min(crop.w, crop.h), fs = this.faceSeen;
+        let side, cx, cy;
+        if (fs && performance.now() - fs.t < 1000) {
+          side = Math.max(160, Math.min(full, fs.size * 4)); cx = fs.cx; cy = fs.cy;
+        } else {
+          side = full; cx = crop.x + crop.w / 2;
+          const k = this.frameId % 3, span = Math.max(0, (crop.h > crop.w ? crop.h : crop.w) - side);
+          if (crop.h > crop.w) cy = crop.y + side / 2 + span * k / 2; else { cy = crop.y + crop.h / 2; cx = crop.x + side / 2 + span * k / 2; }
+        }
+        const fx0 = Math.min(crop.x + crop.w - side, Math.max(crop.x, cx - side / 2));
+        const fy0 = Math.min(crop.y + crop.h - side, Math.max(crop.y, cy - side / 2));
+        fctx.drawImage(video, fx0, fy0, side, side, 0, 0, FACE_W, FACE_W);
+        this.sentFace = { x: fx0, y: fy0, w: side, h: side };
+        msg.faceBitmap = await createImageBitmap(fsmall); tr.push(msg.faceBitmap);
+      }
+      this.worker.postMessage(msg, tr);
     } catch (e) { this.busy = false; }
   },
 
@@ -471,7 +523,9 @@ const HANDS = {
     this.ms = this.ms ? this.ms * 0.8 + m.ms * 0.2 : m.ms;
     if (this.last) this.rate = this.rate * 0.8 + (1000 / Math.max(1, now - this.last)) * 0.2;
     this.last = now;
-    setHands(m.hands || [], now, this.sentCrop);
+    setHands(m.hands || [], now, this.sentCrop, m.face, this.sentFace);
+    if (handRes.face) { const f = handRes.face; this.faceSeen = { cx: f.kp[2][0], cy: f.kp[2][1], size: f.size, t: now }; }
+    signsOnFrame(now);
     if (this.bench) this.benchStep(m.ms, m.delegate);
   },
 
@@ -497,9 +551,10 @@ const HANDS = {
 };
 
 // convierte al sistema del lienzo (pixeles, con espejo si es camara frontal)
-function setHands(list, now, c = crop) {
+function setHands(list, now, c = crop, face = null, fc = c) {
   handRes = { t: now, hands: list.map(h => ({ label: h.label,
-    vpts: h.pts.map(([x, y]) => [c.x + x * c.w, c.y + y * c.h]) })) };       // coordenadas del video
+    vpts: h.pts.map(([x, y]) => [c.x + x * c.w, c.y + y * c.h]) })),         // coordenadas del video
+    face: face ? { kp: face.kp.map(([x, y]) => [fc.x + x * fc.w, fc.y + y * fc.h]), size: Math.max(1, face.box[2] * fc.w) } : null };
 }
 const cpts = h => h.vpts.map(([x, y]) => v2c(x, y));                        // a la pantalla
 
@@ -835,6 +890,209 @@ function drawGestureHUD(now) {
   }
 }
 
+
+// ---------------------------------------------------------------- lengua de senas
+// Cada seña se aprende con 3-5 ejemplos grabados en la app. Cada ejemplo es un
+// clip de ~1.5 s convertido en 12 cuadros; cada cuadro guarda, por mano:
+//   - la forma (21 puntos relativos a la muneca, en "palmas")
+//   - la posicion respecto a la cara (barbilla, frente, pecho...)
+//   - la posicion absoluta en palmas, de donde se saca el MOVIMIENTO (velocidad),
+//     asi un circulo o un vaiven se reconocen aunque la cara no salga.
+// Reconocer = comparar la ventana reciente con cada ejemplo con DTW (alinea
+// en el tiempo aunque la seña se haga mas rapido o mas lento).
+const SIGN_N = 12, SIGN_WIN = 1500, SIGN_DIMS = 94, NOFACE = 99;
+const SIGN_PRESETS = ["A", "E", "I", "O", "U", "Hola", "Gracias", "Mucho gusto", "Por favor", "Sí", "No"];
+const SG = { lib: {}, buf: [], lastEval: 0, miss: 0, streak: { w: null, n: 0 }, lastEmit: { w: null, t: 0 }, released: true,
+             words: [], cand: null, rec: null };
+try { const d = JSON.parse(localStorage.getItem("visor-signs") || "{}"); if (d.v === 1) SG.lib = d.signs || {}; } catch (e) {}
+const saveSigns = () => { try { localStorage.setItem("visor-signs", JSON.stringify({ v: 1, signs: SG.lib })); } catch (e) { status("No hay espacio para guardar más señas."); } };
+
+function signFeature(hr) {
+  const f = new Array(SIGN_DIMS).fill(0);
+  const hs = hr.hands.slice(0, 2).sort((a, b) =>
+    a.label === b.label ? a.vpts[0][0] - b.vpts[0][0] : (a.label === "Right" ? -1 : 1));
+  const face = hr.face;
+  hs.forEach((h, slot) => {
+    const P = h.vpts, w = P[0], s = dist(P[0], P[9]) || 1, o = slot * 45;
+    for (let i = 0; i < 21; i++) { f[o + 2 * i] = (P[i][0] - w[0]) / s; f[o + 2 * i + 1] = (P[i][1] - w[1]) / s; }
+    if (face) {                                                     // mano respecto a la nariz, en anchos de cara
+      f[o + 42] = 3 * (P[9][0] - face.kp[2][0]) / face.size;
+      f[o + 43] = 3 * (P[9][1] - face.kp[2][1]) / face.size;
+    } else { f[o + 42] = f[o + 43] = NOFACE; }                      // sin cara: no se compara el lugar
+    f[o + 44] = 2;                                                  // mano presente
+    f[90 + slot * 2] = P[9][0] / s; f[91 + slot * 2] = P[9][1] / s; // posicion absoluta (para el movimiento)
+  });
+  return f;
+}
+
+function resample(frames, t0, t1) {
+  const out = [];
+  for (let k = 0; k < SIGN_N; k++) {
+    const t = t0 + (t1 - t0) * k / (SIGN_N - 1);
+    let best = frames[0];
+    for (const fr of frames) if (Math.abs(fr.t - t) < Math.abs(best.t - t)) best = fr;
+    out.push(best.f);
+  }
+  return out;
+}
+const r3 = v => Math.round(v * 1000) / 1000;
+
+// distancia entre dos cuadros: forma + lugar + movimiento (velocidad)
+function frameDist(A, i, B, j) {
+  const a = A[i], b = B[j];
+  let d = 0;
+  for (let k = 0; k < 90; k++) {
+    const r = k % 45;
+    if ((r === 42 || r === 43) && (a[k] === NOFACE || b[k] === NOFACE)) continue;   // falta la cara en alguno
+    const x = a[k] - b[k]; d += x * x;
+  }
+  for (let slot = 0; slot < 2; slot++) {
+    const kx = 90 + slot * 2, ky = kx + 1;
+    const va = i ? [a[kx] - A[i - 1][kx], a[ky] - A[i - 1][ky]] : [0, 0];
+    const vb = j ? [b[kx] - B[j - 1][kx], b[ky] - B[j - 1][ky]] : [0, 0];
+    // solo si la mano esta en ambos cuadros
+    if (a[slot * 45 + 44] && b[slot * 45 + 44]) d += 25 * ((va[0] - vb[0]) ** 2 + (va[1] - vb[1]) ** 2);
+  }
+  return d / 40;
+}
+function dtw(A, B) {
+  const n = A.length, m = B.length, M = m + 1, D = new Float64Array((n + 1) * M).fill(Infinity);
+  D[0] = 0;
+  for (let i = 1; i <= n; i++) for (let j = 1; j <= m; j++) {
+    const c = frameDist(A, i - 1, B, j - 1);
+    D[i * M + j] = c + Math.min(D[(i - 1) * M + j], D[i * M + j - 1], D[(i - 1) * M + j - 1]);
+  }
+  return D[n * M + m] / (n + m);
+}
+function wordThreshold(exs) {
+  if (exs.length < 2) return 0.08;
+  const ds = [];
+  for (let i = 0; i < exs.length; i++) for (let j = i + 1; j < exs.length; j++) ds.push(dtw(exs[i], exs[j]));
+  ds.sort((a, b) => a - b);
+  return Math.min(0.3, Math.max(0.02, ds[Math.floor(ds.length / 2)] * 2.5));
+}
+const thrCache = {};
+const thrOf = w => thrCache[w] ?? (thrCache[w] = wordThreshold(SG.lib[w]));
+
+// cada resultado de manos llega aqui
+function signsOnFrame(now) {
+  if (!S.signs || !handRes) return;
+  const has = handRes.hands.length > 0;
+  SG.buf.push({ t: now, f: has ? signFeature(handRes) : null });
+  while (SG.buf.length && now - SG.buf[0].t > 3000) SG.buf.shift();
+  if (SG.rec && SG.rec.phase === "rec" && has) SG.rec.frames.push({ t: now, f: signFeature(handRes) });
+  if (SG.rec || now - SG.lastEval < 200) return;
+  SG.lastEval = now;
+  const win = SG.buf.filter(b => now - b.t <= SIGN_WIN);
+  const withHands = win.filter(b => b.f);
+  if (win.length < 4 || withHands.length < win.length * 0.6 || now - withHands[0].t < SIGN_WIN * 0.8) {   // sin manos o gesto incompleto
+    SG.cand = null; SG.streak = { w: null, n: 0 };
+    if (withHands.length < win.length * 0.6) SG.released = true;       // bajo las manos: puede repetir
+    return;
+  }
+  const seq = resample(withHands, withHands[0].t, now);
+  let best = null, second = null;
+  for (const [w, exs] of Object.entries(SG.lib)) {
+    if (!exs.length) continue;
+    let d = Infinity; for (const e of exs) d = Math.min(d, dtw(seq, e));
+    if (!best || d < best.d) { second = best; best = { w, d }; } else if (!second || d < second.d) second = { w, d };
+  }
+  if (!best) { SG.cand = null; return; }
+  const thr = thrOf(best.w) * (S.signSens || 1);
+  const ok = best.d < thr && (!second || best.d < second.d * 0.85);
+  SG.cand = { w: best.w, conf: Math.max(0, Math.min(1, 1 - best.d / (thr * 1.6))), ok };
+  // la misma palabra solo se repite tras una pausa real (~0.6 s sin reconocerla)
+  // si la duda sigue apuntando a la misma palabra, no cuenta como pausa
+  if (!ok) { SG.streak = { w: null, n: 0 }; if (best.w !== SG.lastEmit.w && ++SG.miss >= 3) SG.released = true; return; }
+  SG.streak = SG.streak.w === best.w ? { w: best.w, n: SG.streak.n + 1 } : { w: best.w, n: 1 };
+  if (best.w !== SG.lastEmit.w) SG.released = true; else SG.miss = 0;
+  // 2 evaluaciones seguidas (~0.4 s) y no repetir la misma palabra mientras se sostiene
+  if (SG.streak.n >= 2 && SG.released) {
+    SG.words.push({ w: best.w, t: now }); if (SG.words.length > 30) SG.words.shift();
+    SG.lastEmit = { w: best.w, t: now }; SG.released = false;
+  }
+}
+
+// grabar un ejemplo: cuenta 3-2-1, graba 1.5 s y guarda
+function recordSignExample(word) {
+  SG.rec = { word, phase: "count", t0: performance.now(), frames: [] };
+  $("teach").hidden = true;
+  const tick = () => {
+    const r = SG.rec; if (!r) return;
+    const el = performance.now() - r.t0;
+    if (r.phase === "count" && el >= 3000) { r.phase = "rec"; r.t0 = performance.now(); r.frames = []; }
+    else if (r.phase === "rec" && el >= SIGN_WIN) {
+      const fr = r.frames; SG.rec = null; $("teach").hidden = false;
+      if (fr.length < 5) { $("teachStatus").textContent = "No vi tus manos bien. Ponte frente a la cámara con buena luz e inténtalo otra vez."; return; }
+      const seq = resample(fr, fr[0].t, fr[fr.length - 1].t).map(v => v.map(r3));
+      (SG.lib[word] = SG.lib[word] || []).push(seq);
+      delete thrCache[word]; saveSigns(); renderSignList();
+      const n = SG.lib[word].length;
+      $("teachStatus").textContent = `Ejemplo ${n} de "${word}" guardado.` + (n < 3 ? " Graba al menos 3 para que la reconozca bien." : "");
+      return;
+    }
+    setTimeout(tick, 50);
+  };
+  tick();
+}
+
+function renderSignList() {
+  const box = $("signList"); box.innerHTML = "";
+  const entries = Object.entries(SG.lib).filter(([, e]) => e.length);
+  if (!entries.length) { box.innerHTML = "<p>Aún no hay señas. Elige una palabra y graba 3 ejemplos.</p>"; return; }
+  for (const [w, exs] of entries) {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;justify-content:space-between;gap:8px;border-bottom:1px solid var(--line);padding:8px 0";
+    const name = document.createElement("span"); name.textContent = `${w} · ${exs.length} ejemplo${exs.length > 1 ? "s" : ""}`;
+    const del = document.createElement("button"); del.className = "opt"; del.style.flex = "0 0 auto"; del.style.minWidth = "0";
+    del.textContent = "Borrar"; del.onclick = () => { delete SG.lib[w]; delete thrCache[w]; saveSigns(); renderSignList(); };
+    row.append(name, del); box.append(row);
+  }
+}
+
+function drawSigns(now) {
+  if (!S.signs) return;
+  const W = canvas.width, H = canvas.height;
+  // puntos de la cara (para ver que la esta ubicando)
+  if (handRes && handRes.face && now - handRes.t < 500) {
+    ctx.strokeStyle = "rgba(255,179,71,0.9)"; ctx.lineWidth = Math.max(1, px(0.7));
+    handRes.face.kp.slice(0, 4).forEach(([x, y]) => { const [X, Y] = v2c(x, y);
+      ctx.beginPath(); ctx.moveTo(X - px(3), Y); ctx.lineTo(X + px(3), Y); ctx.moveTo(X, Y - px(3)); ctx.lineTo(X, Y + px(3)); ctx.stroke(); });
+  }
+  // cuenta regresiva / grabando
+  if (SG.rec) {
+    const el = now - SG.rec.t0;
+    const big = SG.rec.phase === "count" ? String(3 - Math.floor(el / 1000)) : "● GRABANDO";
+    ctx.font = font(SG.rec.phase === "count" ? 60 : 16, 600); ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillStyle = "rgba(4,10,14,0.55)"; ctx.fillRect(0, H * 0.4 - px(40), W, px(80));
+    ctx.fillStyle = SG.rec.phase === "count" ? "#e6f6ff" : "#ff3b5c"; ctx.fillText(big, W / 2, H * 0.4);
+    ctx.font = font(9, 500); ctx.fillStyle = "#37e6ff";
+    ctx.fillText(`Seña: ${SG.rec.word}`, W / 2, H * 0.4 + px(28));
+    if (SG.rec.phase === "rec") { ctx.fillStyle = "#ff3b5c"; ctx.fillRect(0, H * 0.4 + px(38), W * Math.min(1, el / SIGN_WIN), px(2)); }
+    ctx.textAlign = "left";
+    return;
+  }
+  // subtitulos: palabras de los ultimos 8 s
+  const recent = SG.words.filter(x => now - x.t < 8000).slice(-6);
+  const y = Math.min(H - RES.bottom - px(34), HUDL.counterTop - px(20));
+  if (recent.length) {
+    const text = recent.map(x => x.w).join(" ");
+    ctx.font = font(15, 600); const tw = Math.min(W - px(16), ctx.measureText(text).width + px(20));
+    ctx.fillStyle = "rgba(4,10,14,0.72)"; ctx.fillRect((W - tw) / 2, y - px(13), tw, px(26));
+    ctx.fillStyle = "#ffffff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(text, W / 2, y, W - px(24)); ctx.textAlign = "left";
+  } else if (!Object.keys(SG.lib).length) {
+    ctx.font = font(8.5, 500); ctx.fillStyle = "#e6f6ff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText("Enseña señas en Ajustes → Enseñar señas", W / 2, y); ctx.textAlign = "left";
+  }
+  // candidato actual (pequeno)
+  if (SG.cand) {
+    ctx.font = font(7.5, 500); ctx.fillStyle = SG.cand.ok ? "#6dff9e" : "#7f9aa8"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+    ctx.fillText(`${SG.cand.ok ? "" : "¿"}${SG.cand.w}${SG.cand.ok ? "" : "?"} ${Math.round(SG.cand.conf * 100)}%`, W / 2, y - px(22));
+    ctx.textAlign = "left";
+  }
+}
+
 // ---------------------------------------------------------------- fuentes
 async function safePlay() {
   try { await video.play(); }
@@ -877,6 +1135,7 @@ async function launch(kind, file) {
   try {
     $("camBtn").disabled = $("galBtn").disabled = true;
     await AI.init();
+    if (S.signs) S.hands = true;
     if (S.hands) await HANDS.start();
     if (kind === "camera") await startCamera(); else await startFile(file);
     $("start").hidden = true; $("top").hidden = false; $("bottom").hidden = false;
@@ -1039,7 +1298,9 @@ function drawHands() {
   });
 }
 
+const HUDL = { counterTop: 1e9 };                 // donde empieza el contador (para no encimar subtitulos)
 function drawFrameHUD(now) {
+  HUDL.counterTop = 1e9;
   const W = canvas.width, H = canvas.height;
   const m = px(10), L = px(22), T = RES.top + px(6), B = H - RES.bottom - px(6);
   ctx.strokeStyle = "rgba(230,246,255,0.7)"; ctx.lineWidth = Math.max(1, px(0.7));
@@ -1059,6 +1320,7 @@ function drawFrameHUD(now) {
     tracks.filter(t => t.hits >= 2).forEach(t => cnt[t.label] = (cnt[t.label] || 0) + 1);
     const rows = Object.entries(cnt).sort((a, b) => b[1] - a[1]).slice(0, 6);
     const x = m + px(4); let y = B - px(8) - rows.length * px(12) - px(16);
+    HUDL.counterTop = y - px(4);
     ctx.fillStyle = "rgba(4,10,14,0.6)";
     ctx.fillRect(x - px(4), y - px(4), px(118), rows.length * px(12) + px(28));
     ctx.textBaseline = "top"; ctx.font = font(7.5, 500); ctx.fillStyle = "#7f9aa8";
@@ -1115,11 +1377,12 @@ function loop(now) {
   drawBase(ctx, W, H);
 
   AI.pump();                              // no espera: la IA responde cuando puede
-  if (S.hands) { HANDS.pump(); updateGestures(now); }
+  if (S.hands) { HANDS.pump(); if (!S.signs) updateGestures(now); }
   drawPanels(now);
   drawTracks(now, dtFrame);
-  if (S.hands) { drawHands(); drawGestureHUD(now); }
+  if (S.hands) { drawHands(); if (!S.signs) drawGestureHUD(now); }
   drawFrameHUD(now);
+  drawSigns(now);
 
   if (now - chipT > 400) {
     chipT = now;
@@ -1211,6 +1474,7 @@ function syncSettings() {
     b.setAttribute("aria-pressed", String(S[seg.dataset.key] === b.dataset.v))));
   document.querySelectorAll(".seg[data-multi] .opt").forEach(b => b.setAttribute("aria-pressed", String(!!S[b.dataset.k])));
   $("conf").value = Math.round(S.conf * 100); $("confV").textContent = Math.round(S.conf * 100) + "%";
+  $("signSens").value = Math.round((S.signSens || 1) * 100); $("signSensV").textContent = Math.round((S.signSens || 1) * 100) + "%";
 }
 document.querySelectorAll(".seg[data-key] .opt").forEach(b => b.onclick = () => {
   S[b.parentElement.dataset.key] = b.dataset.v; save(); syncSettings(); });
@@ -1224,6 +1488,7 @@ function diagText() {
     return c ? (d ? c.getParameter(d.UNMASKED_RENDERER_WEBGL) : "WebGL2 sí") : "sin WebGL2"; } catch (e) { return "?"; } })();
   return [
     `Versión: ${APPV}`,
+    `Señas: ${S.signs ? "activas" : "apagadas"} · ${Object.keys(SG.lib).length} palabras · ${Object.values(SG.lib).reduce((a, e) => a + e.length, 0)} ejemplos${handRes && handRes.face ? " · cara ubicada" : ""}`,
     `IA en: ${AI.mode === "worker" ? "hilo aparte (bien)" : AI.mode === "main" ? "hilo principal (compatibilidad)" : "—"}`,
     `Motor: ${delegate}${AI.benchResults ? "  medición " + JSON.stringify(AI.benchResults) : ""}`,
     AI.fallbackReason ? `Motivo del respaldo: ${AI.fallbackReason}` : "",
@@ -1235,6 +1500,51 @@ function diagText() {
     `Workers de módulo: ${typeof OffscreenCanvas !== "undefined" ? "OffscreenCanvas sí" : "sin OffscreenCanvas"}`,
     `Navegador: ${navigator.userAgent}`,
   ].filter(Boolean).join(String.fromCharCode(10));
+}
+// --- senas: UI
+SIGN_PRESETS.forEach(w => { const b = document.createElement("button"); b.className = "opt";
+  b.style.cssText = "flex:0 0 auto;min-width:0;padding:8px 10px;white-space:nowrap";
+  b.textContent = w; b.onclick = () => { $("signWord").value = w; }; $("presets").append(b); });
+$("openTeach").onclick = async () => {
+  S.signs = true; S.hands = true; save(); syncSettings();
+  $("settings").hidden = true; await ensureSignsRunning();
+  renderSignList(); $("teachStatus").textContent = ""; $("teach").hidden = false;
+};
+$("closeTeach").onclick = () => { $("teach").hidden = true; };
+$("recSign").onclick = async () => {
+  const w = $("signWord").value.trim();
+  if (!w) { $("teachStatus").textContent = "Escribe primero la palabra de la seña."; return; }
+  if (!running) { $("teachStatus").textContent = "Abre la cámara primero."; return; }
+  await ensureSignsRunning();
+  recordSignExample(w);
+};
+$("expSigns").onclick = async () => {
+  const blob = new Blob([JSON.stringify({ v: 1, signs: SG.lib })], { type: "application/json" });
+  const file = new File([blob], "senas-visor.json", { type: "application/json" });
+  try { if (navigator.canShare && navigator.canShare({ files: [file] })) { await navigator.share({ files: [file], title: "Señas" }); return; } } catch (e) { if (e.name === "AbortError") return; }
+  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "senas-visor.json";
+  document.body.appendChild(a); a.click(); a.remove();
+};
+$("impSigns").onclick = () => $("impFile").click();
+$("impFile").onchange = async e => {
+  const f = e.target.files[0]; e.target.value = ""; if (!f) return;
+  try {
+    const d = JSON.parse(await f.text());
+    if (d.v !== 1 || !d.signs) throw new Error("formato");
+    let n = 0;
+    for (const [w, exs] of Object.entries(d.signs)) {
+      const ok = exs.filter(x => Array.isArray(x) && x.length === SIGN_N && x.every(v => v.length === SIGN_DIMS));
+      if (ok.length) { (SG.lib[w] = SG.lib[w] || []).push(...ok); delete thrCache[w]; n += ok.length; }
+    }
+    saveSigns(); renderSignList(); $("teachStatus").textContent = `Importados ${n} ejemplos.`;
+  } catch (err) { $("teachStatus").textContent = "Ese archivo no es de señas de Visor Scan."; }
+};
+$("signSens").oninput = e => { S.signSens = e.target.value / 100; save(); syncSettings(); };
+async function ensureSignsRunning() {
+  if (!S.signs) return;
+  S.hands = true;
+  if (HANDS.ready && !HANDS.face) HANDS.stop();                  // reiniciar con deteccion de cara
+  await HANDS.start();
 }
 $("clearPanels").onclick = () => { panels = []; say("Paneles borrados"); };
 // borra la copia guardada de la app (no los modelos) y recarga la version mas reciente
@@ -1261,7 +1571,8 @@ $("rebench").onclick = async () => {
 $("setBtn").onclick = () => { syncSettings(); $("diag").textContent = diagText(); $("settings").hidden = false; };
 $("closeSet").onclick = async () => { $("settings").hidden = true;
   try { await AI.init(); } catch (e) { status("No se pudo cargar el modelo."); }
-  if (S.hands) HANDS.start(); else HANDS.stop(); };
+  if (S.signs) { await ensureSignsRunning(); return; }
+  if (S.hands) { if (HANDS.ready && HANDS.face) HANDS.stop(); HANDS.start(); } else HANDS.stop(); };
 // ---------------------------------------------------------------- primer plano
 // La camara y el microfono solo se usan con la app en primer plano: al salir
 // (otra app, pantalla bloqueada) se apagan; al volver se reabren con el mismo zoom.
@@ -1306,7 +1617,8 @@ window.__visor = { get tracks() { return tracks; }, get fps() { return fps; }, g
                    get aiRate() { return aiRate; }, get delegate() { return delegate; }, get mode() { return AI.mode; },
                    get bench() { return AI.benchResults; }, get ai() { return AI; }, get handsCtl() { return HANDS; },
                    get panels() { return panels; }, set panels(v) { panels = v; }, get handRes() { return handRes; },
-                   get creating() { return creating; }, setHands, updateGestures, G, S, view, v2c, setZoom };
+                   get creating() { return creating; }, setHands, updateGestures, G, S, view, v2c, setZoom,
+                   SG, signFeature, resample, dtw, signsOnFrame, recordSignExample, thrOf };
 </script>
 </body>
 </html>
